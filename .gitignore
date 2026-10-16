@@ -1,0 +1,5 @@
+build*/
+dist/
+*.gkernel
+*.seed
+__pycache__/
