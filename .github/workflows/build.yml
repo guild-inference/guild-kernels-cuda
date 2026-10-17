@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: guild-inference/Guild
-          ref: a5cd2365d6a181dbf8c47a2818bea3c3c2ab7f3b
+          ref: 098e80d6eec18a9e7a58f0d6aeacb4ea9c48995a
           path: sdk-source
       - run: cmake -S sdk-source/sdk -B sdk-build -DCMAKE_INSTALL_PREFIX=/opt/guild-sdk && cmake --install sdk-build
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/guild-sdk -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.sm }} && cmake --build build -j2

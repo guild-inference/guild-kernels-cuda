@@ -1,5 +1,6 @@
 #include <guild/abi/kernel_abi.h>
 #include <guild/abi/cuda_dense_abi.h>
+#include <guild/abi/cuda_attn_abi.h>
 #include <cuda_runtime.h>
 #include <vector>
 #include <cstdio>
@@ -15,6 +16,13 @@ int main(){
         if(d->op_kind==GUILD_OP_QUANTIZED_GEMV) {
             const auto* dense=static_cast<const guild_cuda_dense_ext_v1_t*>(d->next_ext);
             CHECK(dense && dense->struct_size==sizeof(*dense) && dense->tag==GUILD_CUDA_DENSE_TAG_V1 && dense->bf16 && dense->mmvq);
+            return GUILD_STATUS_OK;
+        }
+        if(d->op_kind==GUILD_OP_ATTENTION_DECODE) {
+            const auto* attn=static_cast<const guild_cuda_attn_ext_v1_t*>(d->next_ext);
+            CHECK(attn && attn->struct_size==sizeof(*attn) && attn->tag==GUILD_CUDA_ATTN_TAG_V1 &&
+                  attn->configure && attn->rope && attn->qsa_norm_gate && attn->gdn &&
+                  attn->kv && attn->qsa_index_select && attn->attention);
             return GUILD_STATUS_OK;
         }
         CHECK(d->op_kind==GUILD_OP_MOE_ROUTER_TOPK && d->next_ext);

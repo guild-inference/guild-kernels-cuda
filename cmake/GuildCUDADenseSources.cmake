@@ -15,3 +15,4 @@ function(guild_cuda_attach_dense target)
     "${GUILD_CUDA_DENSE_ROOT}/src/math/native_mmvq.cu"
     PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 endfunction()
+include("${CMAKE_CURRENT_LIST_DIR}/GuildCUDAAttnSources.cmake")

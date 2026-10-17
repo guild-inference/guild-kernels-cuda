@@ -8,6 +8,7 @@
 
 #include "guild/abi/kernel_abi.h"
 #include "guild/cuda/dense_backend.h"
+#include "guild/cuda/attn_backend.h"
 
 #if defined(GUILD_ENABLE_CUDA) || defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -283,6 +284,18 @@ guild_status_t plugin_init(guild_core_host_t host, const guild_host_api_v1_t* ap
     dense.supported_sync_modes=GUILD_SYNC_STREAM_ORDERED|GUILD_SYNC_HOST_BLOCKING|GUILD_SYNC_GRAPH_CAPTURE;
     dense.priority=300;dense.next_ext=guild_cuda_dense_table_v1();
     st=api->register_kernel_op(host,&dense,err);
+    if(st!=GUILD_STATUS_OK)return st;
+    guild_kernel_op_desc_v1_t attn{};
+    attn.struct_size=sizeof(attn);attn.abi_version=GUILD_KERNEL_ABI_VERSION_V1;
+    attn.op_kind=GUILD_OP_ATTENTION_DECODE;attn.op_name="attention_decode";
+    attn.impl_id="external.cuda.attn.v1";attn.package_id="org.guild.kernels.cuda";
+    attn.impl_version=GUILD_EXT_PLUGIN_VERSION_ENCODED;attn.backend=GUILD_BACKEND_CUDA;
+    attn.min_sm_version=60;attn.weight_dtype=GUILD_DTYPE_ANY;attn.input_dtype=GUILD_DTYPE_F32;
+    attn.output_dtype=GUILD_DTYPE_F32;attn.accum_dtype=GUILD_DTYPE_F32;attn.max_batch_rows=8;
+    attn.numerical_flags=GUILD_NUM_BITWISE_DETERMINISTIC|GUILD_NUM_EXACT_SINGLE_COL_EQUIV;
+    attn.supported_sync_modes=GUILD_SYNC_STREAM_ORDERED|GUILD_SYNC_HOST_BLOCKING|GUILD_SYNC_GRAPH_CAPTURE;
+    attn.priority=300;attn.next_ext=guild_cuda_attn_table_v1();
+    st=api->register_kernel_op(host,&attn,err);
     if(st!=GUILD_STATUS_OK)return st;
 #endif
 
