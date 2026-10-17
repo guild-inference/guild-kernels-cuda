@@ -4,21 +4,35 @@ permissions:
   contents: read
 jobs:
   compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolkit: cuda12-sm61
+            image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            sm: '61'
+          - toolkit: cuda13-sm75
+            image: nvidia/cuda:13.0.2-devel-ubuntu22.04@sha256:6b6617592b94e7dcc6ffbe6d00720eed27bc6e3b4f06b26b93b4070c31f57391
+            sm: '75'
     runs-on: ubuntu-22.04
-    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    container: ${{ matrix.image }}
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
     steps:
       - run: apt-get update && apt-get install -y git g++ python3-pip && pip3 install cmake==3.28.4
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
           repository: guild-inference/Guild
-          ref: 4b4ded0827f63e62b8e6c61571f866cc551fdd0c
+          ref: a5cd2365d6a181dbf8c47a2818bea3c3c2ab7f3b
           path: sdk-source
       - run: cmake -S sdk-source/sdk -B sdk-build -DCMAKE_INSTALL_PREFIX=/opt/guild-sdk && cmake --install sdk-build
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/guild-sdk -DCMAKE_CUDA_ARCHITECTURES=61 && cmake --build build -j2
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/guild-sdk -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.sm }} && cmake --build build -j2
       - run: cmake --install build --prefix "$PWD/build/package"
       - uses: actions/upload-artifact@v4
         with:
-          name: cuda-sm61-unsigned-staging
+          name: ${{ matrix.toolkit }}-unsigned-compile-only
           path: build/package/
           include-hidden-files: true

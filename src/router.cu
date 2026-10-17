@@ -7,6 +7,7 @@
 // Copyright (c) Guild Inference Contributors. MIT License.
 
 #include "guild/abi/kernel_abi.h"
+#include "guild/cuda/dense_backend.h"
 
 #if defined(GUILD_ENABLE_CUDA) || defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -271,6 +272,18 @@ guild_status_t plugin_init(guild_core_host_t host, const guild_host_api_v1_t* ap
 
     st = api->register_kernel_op(host, &router_desc, err);
     if (st != GUILD_STATUS_OK) return st;
+    guild_kernel_op_desc_v1_t dense{};
+    dense.struct_size=sizeof(dense);dense.abi_version=GUILD_KERNEL_ABI_VERSION_V1;
+    dense.op_kind=GUILD_OP_QUANTIZED_GEMV;dense.op_name="cuda_dense";
+    dense.impl_id="external.cuda.dense.v1";dense.package_id="org.guild.kernels.cuda";
+    dense.impl_version=GUILD_EXT_PLUGIN_VERSION_ENCODED;dense.backend=GUILD_BACKEND_CUDA;
+    dense.min_sm_version=60;dense.weight_dtype=GUILD_DTYPE_ANY;dense.input_dtype=GUILD_DTYPE_ANY;
+    dense.output_dtype=GUILD_DTYPE_F32;dense.accum_dtype=GUILD_DTYPE_F32;dense.max_batch_rows=512;
+    dense.numerical_flags=GUILD_NUM_BITWISE_DETERMINISTIC|GUILD_NUM_EXACT_SINGLE_COL_EQUIV;
+    dense.supported_sync_modes=GUILD_SYNC_STREAM_ORDERED|GUILD_SYNC_HOST_BLOCKING|GUILD_SYNC_GRAPH_CAPTURE;
+    dense.priority=300;dense.next_ext=guild_cuda_dense_table_v1();
+    st=api->register_kernel_op(host,&dense,err);
+    if(st!=GUILD_STATUS_OK)return st;
 #endif
 
     return GUILD_STATUS_OK;

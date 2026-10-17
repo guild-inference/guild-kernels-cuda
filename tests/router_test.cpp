@@ -1,4 +1,5 @@
 #include <guild/abi/kernel_abi.h>
+#include <guild/abi/cuda_dense_abi.h>
 #include <cuda_runtime.h>
 #include <vector>
 #include <cstdio>
@@ -11,6 +12,11 @@ int main(){
     guild_plugin_descriptor_v1_t p{};guild_host_api_v1_t host{};host.struct_size=sizeof(host);
     host.negotiate_abi=+[](uint32_t a,uint32_t* b)->guild_status_t{*b=a;return GUILD_STATUS_OK;};
     host.register_kernel_op=+[](guild_core_host_t,const guild_kernel_op_desc_v1_t* d,guild_error_info_t*)->guild_status_t {
+        if(d->op_kind==GUILD_OP_QUANTIZED_GEMV) {
+            const auto* dense=static_cast<const guild_cuda_dense_ext_v1_t*>(d->next_ext);
+            CHECK(dense && dense->struct_size==sizeof(*dense) && dense->tag==GUILD_CUDA_DENSE_TAG_V1 && dense->bf16 && dense->mmvq);
+            return GUILD_STATUS_OK;
+        }
         CHECK(d->op_kind==GUILD_OP_MOE_ROUTER_TOPK && d->next_ext);
         std::memcpy(&table,d->next_ext,sizeof(table));return GUILD_STATUS_OK;
     };
