@@ -38,7 +38,11 @@
 #include <string>
 
 namespace GUILD_CUDA_DENSE_MATH_NS {
+#ifndef GUILD_CUDA_MOE_MATH_NS
+#define GUILD_CUDA_MOE_MATH_NS guild::kernels
+#endif
 using namespace guild::kernels;
+using namespace GUILD_CUDA_MOE_MATH_NS;
 namespace {
 
 constexpr int QK = 256;

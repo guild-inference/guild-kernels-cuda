@@ -1,6 +1,7 @@
 #include <guild/abi/kernel_abi.h>
 #include <guild/abi/cuda_dense_abi.h>
 #include <guild/abi/cuda_attn_abi.h>
+#include <guild/abi/cuda_moe_abi.h>
 #include <cuda_runtime.h>
 #include <vector>
 #include <cstdio>
@@ -23,6 +24,13 @@ int main(){
             CHECK(attn && attn->struct_size==sizeof(*attn) && attn->tag==GUILD_CUDA_ATTN_TAG_V1 &&
                   attn->configure && attn->rope && attn->qsa_norm_gate && attn->gdn &&
                   attn->kv && attn->qsa_index_select && attn->attention);
+            return GUILD_STATUS_OK;
+        }
+        if(d->op_kind==GUILD_OP_MOE_COMBINE) {
+            const auto* moe=static_cast<const guild_cuda_moe_ext_v1_t*>(d->next_ext);
+            CHECK(moe && moe->struct_size==sizeof(*moe) && moe->tag==GUILD_CUDA_MOE_TAG_V1 &&
+                  moe->configure && moe->quantize_dequant && moe->s_gemv && moe->moe &&
+                  moe->elementwise && moe->sampler && moe->verify && moe->qwen);
             return GUILD_STATUS_OK;
         }
         CHECK(d->op_kind==GUILD_OP_MOE_ROUTER_TOPK && d->next_ext);

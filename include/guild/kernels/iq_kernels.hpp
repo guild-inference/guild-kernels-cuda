@@ -10,7 +10,10 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace guild::kernels {
+#ifndef GUILD_CUDA_MOE_MATH_NS
+#define GUILD_CUDA_MOE_MATH_NS guild::kernels
+#endif
+namespace GUILD_CUDA_MOE_MATH_NS {
 
 /// ggml type ids handled here.
 bool iq_supported(int ggml_type) noexcept;

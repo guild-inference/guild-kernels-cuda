@@ -9,6 +9,7 @@
 #include "guild/abi/kernel_abi.h"
 #include "guild/cuda/dense_backend.h"
 #include "guild/cuda/attn_backend.h"
+#include "guild/cuda/moe_backend.h"
 
 #if defined(GUILD_ENABLE_CUDA) || defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -296,6 +297,18 @@ guild_status_t plugin_init(guild_core_host_t host, const guild_host_api_v1_t* ap
     attn.supported_sync_modes=GUILD_SYNC_STREAM_ORDERED|GUILD_SYNC_HOST_BLOCKING|GUILD_SYNC_GRAPH_CAPTURE;
     attn.priority=300;attn.next_ext=guild_cuda_attn_table_v1();
     st=api->register_kernel_op(host,&attn,err);
+    if(st!=GUILD_STATUS_OK)return st;
+    guild_kernel_op_desc_v1_t moe{};
+    moe.struct_size=sizeof(moe);moe.abi_version=GUILD_KERNEL_ABI_VERSION_V1;
+    moe.op_kind=GUILD_OP_MOE_COMBINE;moe.op_name="moe_combine";
+    moe.impl_id="external.cuda.moe.v1";moe.package_id="org.guild.kernels.cuda";
+    moe.impl_version=GUILD_EXT_PLUGIN_VERSION_ENCODED;moe.backend=GUILD_BACKEND_CUDA;
+    moe.min_sm_version=60;moe.weight_dtype=GUILD_DTYPE_ANY;moe.input_dtype=GUILD_DTYPE_F32;
+    moe.output_dtype=GUILD_DTYPE_F32;moe.accum_dtype=GUILD_DTYPE_F32;moe.max_batch_rows=512;
+    moe.numerical_flags=GUILD_NUM_BITWISE_DETERMINISTIC|GUILD_NUM_EXACT_SINGLE_COL_EQUIV;
+    moe.supported_sync_modes=GUILD_SYNC_STREAM_ORDERED|GUILD_SYNC_HOST_BLOCKING|GUILD_SYNC_GRAPH_CAPTURE;
+    moe.priority=300;moe.next_ext=guild_cuda_moe_table_v1();
+    st=api->register_kernel_op(host,&moe,err);
     if(st!=GUILD_STATUS_OK)return st;
 #endif
 

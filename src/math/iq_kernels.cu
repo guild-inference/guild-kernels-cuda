@@ -21,7 +21,12 @@
 #include <stdexcept>
 #include <string>
 
-namespace guild::kernels {
+#ifndef GUILD_CUDA_MOE_MATH_NS
+#define GUILD_CUDA_MOE_MATH_NS guild::kernels
+#endif
+namespace guild::kernels {}
+namespace GUILD_CUDA_MOE_MATH_NS {
+using namespace guild::kernels;
 namespace {
 
 void check(const char* what) {
