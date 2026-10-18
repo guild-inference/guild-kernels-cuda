@@ -3,7 +3,7 @@
   "publisher_id":"org.guild-inference","scope":"cuda-kernels","version":"@PROJECT_VERSION@",
   "kernel_abi":{"major":1,"minor_min":0,"minor_max":0},"backends":["cuda"],
   "min_sm_version":@PACKAGE_MIN_SM@,"max_sm_version":@PACKAGE_MAX_SM@,
-  "library_path":"lib/libguild_cuda_plugin.so","provided_ops":["external.cuda.router.bf16.v1","external.cuda.dense.v1","external.cuda.attn.v1"],
+  "library_path":"lib/libguild_cuda_plugin.so","provided_ops":["external.cuda.router.bf16.v1","external.cuda.dense.v1","external.cuda.attn.v1","external.cuda.moe.v1"],
   "artifacts":[{"path":"lib/libguild_cuda_plugin.so","role":"shared_library","byte_size":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}],
   "provenance":{"spdx_license":"MIT","source_repo":"https://github.com/guild-inference/guild-kernels-cuda","source_revision":"@PACKAGE_SOURCE_REVISION@"}
 }

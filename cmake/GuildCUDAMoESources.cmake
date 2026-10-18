@@ -1,7 +1,6 @@
 # Canonical MoE, S-family GEMV/dequant, elementwise, sampler, verify, and Qwen specialization CUDA sources.
 get_filename_component(GUILD_CUDA_MOE_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
-function(guild_cuda_attach_moe target)
-  target_sources(${target} PRIVATE
+set(GUILD_CUDA_MOE_SOURCES
     "${GUILD_CUDA_MOE_ROOT}/src/moe_backend.cpp"
     "${GUILD_CUDA_MOE_ROOT}/src/moe/dequant_bf16.cu"
     "${GUILD_CUDA_MOE_ROOT}/src/moe/dequant_s2.cu"
@@ -27,10 +26,16 @@ function(guild_cuda_attach_moe target)
     "${GUILD_CUDA_MOE_ROOT}/src/qwen/native_gr_postops.cu"
     "${GUILD_CUDA_MOE_ROOT}/src/qwen/native_ple_postops.cu"
     "${GUILD_CUDA_MOE_ROOT}/src/qwen/ple.cu")
+function(guild_cuda_attach_moe target)
+  target_sources(${target} PRIVATE ${GUILD_CUDA_MOE_SOURCES})
+  set(_dense_math_ns guild::cuda_dense_math)
+  if(ARGC GREATER 1)
+    set(_dense_math_ns "${ARGV1}")
+  endif()
   target_include_directories(${target} PUBLIC "${GUILD_CUDA_MOE_ROOT}/include")
   target_compile_definitions(${target} PRIVATE
     GUILD_CUDA_MOE_MATH_NS=guild::cuda_moe_math
-    GUILD_CUDA_DENSE_MATH_NS=guild::cuda_dense_math
+    GUILD_CUDA_DENSE_MATH_NS=${_dense_math_ns}
     GUILD_CUDA_ATTN_MATH_NS=guild::cuda_attn_math)
   set(_has_pre75 FALSE)
   foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)

@@ -26,6 +26,23 @@ int main() {
     ctx.sync_mode = GUILD_SYNC_STREAM_ORDERED;
     guild_error_info_t error{};
 
+    // Reject malformed ABI envelopes before touching device buffers.
+    guild_cuda_elementwise_op_v1_t invalid{};
+    invalid.struct_size = sizeof(invalid);
+    invalid.mode = UINT32_MAX;
+    CHECK(table.elementwise(&ctx, &invalid, &error) == GUILD_STATUS_ERR_INVALID_ARGUMENT);
+    invalid.struct_size = sizeof(uint32_t);
+    CHECK(table.elementwise(&ctx, &invalid, &error) == GUILD_STATUS_ERR_ABI_MISMATCH);
+    CHECK(table.elementwise(&ctx, nullptr, &error) == GUILD_STATUS_ERR_INVALID_ARGUMENT);
+    CHECK(table.elementwise(nullptr, &invalid, &error) == GUILD_STATUS_ERR_INVALID_ARGUMENT);
+    auto bad_ctx = ctx;
+    bad_ctx.struct_size = sizeof(uint32_t);
+    CHECK(table.elementwise(&bad_ctx, &invalid, &error) == GUILD_STATUS_ERR_ABI_MISMATCH);
+    bad_ctx = ctx; bad_ctx.abi_version = GUILD_KERNEL_ABI_MAKE_VERSION(2, 0, 0);
+    CHECK(table.elementwise(&bad_ctx, &invalid, &error) == GUILD_STATUS_ERR_ABI_MISMATCH);
+    bad_ctx = ctx; bad_ctx.backend = GUILD_BACKEND_CPU;
+    CHECK(table.elementwise(&bad_ctx, &invalid, &error) == GUILD_STATUS_ERR_INVALID_ARGUMENT);
+
     // 1. Configure flags + queries
     int32_t val = -1;
     guild_cuda_moe_config_v1_t cfg{};
@@ -180,5 +197,10 @@ int main() {
     for (float v : hgrout) CHECK(std::fabs(v - 1.5f) < 1e-4f);
 
     CHECK(cudaStreamDestroy(stream) == cudaSuccess);
+    for (void* ptr : {static_cast<void*>(dx), static_cast<void*>(dy), static_cast<void*>(dq),
+                      static_cast<void*>(dlogits), static_cast<void*>(dw), static_cast<void*>(dexp),
+                      static_cast<void*>(dsh), static_cast<void*>(dmout), static_cast<void*>(dids),
+                      static_cast<void*>(dbad), static_cast<void*>(dcell), static_cast<void*>(dsteps),
+                      static_cast<void*>(dgrw), static_cast<void*>(dgrout)}) CHECK(cudaFree(ptr) == cudaSuccess);
     return 0;
 }

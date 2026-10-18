@@ -84,6 +84,12 @@ void* checked_stream(const guild_exec_context_v1_t* ctx, const char* name) {
     if (ctx->struct_size < sizeof(*ctx)) {
         throw AbiMismatch(std::string(name) + ": exec context struct_size is too small");
     }
+    if (GUILD_KERNEL_ABI_VERSION_MAJOR_OF(ctx->abi_version) != GUILD_KERNEL_ABI_VERSION_MAJOR) {
+        throw AbiMismatch(std::string(name) + ": incompatible exec context ABI");
+    }
+    if (ctx->backend != GUILD_BACKEND_CUDA) {
+        throw std::invalid_argument(std::string(name) + ": expected CUDA exec context");
+    }
     return ctx->device_stream;
 }
 
@@ -657,7 +663,7 @@ guild_status_t qwen_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_qwen
                 break;
             }
             case GUILD_CUDA_QWEN_FUSED_GR_READ_MULTI_V1: {
-                if (c.n_tok < 0 || c.n_tok > math::kFusedGrMaxT) {
+                if (c.n_tok < 0 || c.n_tok > math::kFusedGrMaxT || (c.n_tok && !c.fused_gr_multi)) {
                     throw std::invalid_argument("qwen: fused_gr_read_multi n_tok out of range");
                 }
                 math::FusedGrArgs args[math::kFusedGrMaxT]{};
