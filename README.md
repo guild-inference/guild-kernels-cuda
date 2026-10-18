@@ -1,6 +1,6 @@
 # guild-kernels-cuda
 
-Independent CUDA arithmetic, package `org.guild.kernels.cuda` version 1.2.0,
+Independent CUDA arithmetic, package `org.guild.kernels.cuda` version 1.3.0,
 Kernel ABI v1, installed SDK 1.4. Core software versions are independent.
 
 ## Implemented source ownership
@@ -25,19 +25,27 @@ Kernel ABI v1, installed SDK 1.4. Core software versions are independent.
   - Paged KV append/gather (FP16, INT8, Hadamard-rotated Q4_0) and KV streaming
     CLOCK residency resolution, ring restore, and host staging.
 - Shared BF16/FP16/DP4A/Q8_1 finite conversion and CC emulation helpers.
+- MoE routing/combine, shared and grouped experts, S-family GEMV/dequantization,
+  activation quantization, remote expert device reduction/copy, elementwise and
+  doorbell primitives, sampling and speculative verification device kernels.
+- Isolated Qwen specialization in `src/qwen/`: GR, fused GR, PLE and cvec
+  arithmetic. Model topology, allocations, files and scheduling remain in Core.
 - The existing PFKE router projection remains compatible.
 
-`cmake/GuildCUDADenseSources.cmake` and `cmake/GuildCUDAAttnSources.cmake` own
+`cmake/GuildCUDADenseSources.cmake`, `cmake/GuildCUDAAttnSources.cmake` and
+`cmake/GuildCUDAMoESources.cmake` own
 the bundled/DSO source lists and per-file arithmetic flags. `native_bf16.cu`,
 `native_mmvq.cu`, and the seven `native_*.cu` attention/GDN/RoPE adapters retain
 fast math; the IQ, legacy BF16, and canonical QSA/GDN/KV sources retain their
-previous flags. Backend implementation symbols are private; CDD1 and CDA1
+previous flags. Backend implementation symbols are private; CDD1, CDA1 and CDM1
 callbacks expose only public C records/status codes. No private Guild
 headers/libraries or source-tree paths are build inputs.
 
 `external.cuda.dense.v1` exposes CDD1 (`guild_cuda_dense_ext_v1_t`) on
 `GUILD_OP_QUANTIZED_GEMV`, and `external.cuda.attn.v1` exposes CDA1
-(`guild_cuda_attn_ext_v1_t`) on `GUILD_OP_ATTENTION_DECODE`, alongside the
+(`guild_cuda_attn_ext_v1_t`) on `GUILD_OP_ATTENTION_DECODE`.
+`external.cuda.moe.v1` exposes CDM1 (`guild_cuda_moe_ext_v1_t`) on
+`GUILD_OP_MOE_COMBINE`, alongside the
 frozen PFKE `external.cuda.router.bf16.v1` operation. Discovery performs no CUDA
 initialization. Calls use caller-owned buffers and an explicit stream, preserve
 capture/replay launch geometry, and translate C++ exceptions to C errors. Normal
@@ -47,10 +55,11 @@ successful-callback instrumentation uses `GUILD_CUDA_INSTRUMENT=1`.
 The IQ data is compiled from pinned GGML
 `3cf03257f219afbe7334045ff7c6a06ac68c627d`. Device codebooks are module constants;
 these operations do not call or depend on another DSO's GGML CPU initialization.
-MMQ context initialization, cuBLAS GEMM, MoE grouped dispatch, elementwise,
-sampling, verification helpers, and Qwen specializations still require their own
-contracts/migration. Full external-only CUDA inference remains an open
-integration gate; independent kernel tests do not establish that gate.
+Legacy MMQ context initialization, cuBLAS GEMM and Qwen4Exp prefill remain in Core.
+Ornith-1.5-35B inference has passed with Core's bundled dense, attention and MoE
+groups disabled, including first-token logits, greedy IDs, recurrent state and
+the tested host-KV prefix. That does not establish external-only execution of
+legacy Qwen4Exp prefill or multi-GPU inference.
 
 ## Independent build and device tests
 
@@ -65,10 +74,10 @@ cmake --install build --prefix "$PWD/build/package"
 ```
 
 CUDA12.0/GCC12 nvcc host, GCC13.3 C++, GTX1070 SM61: the router test, dense
-test, and attention/GDN/RoPE/KV test pass. Dense and attention tests use exact
+test, attention/GDN/RoPE/KV test, and MoE test pass. Dense and attention tests use exact
 scalar oracles, capture/replay, short records, wrong ABI, invalid modes and
 undersized scratch. Checks remain active in Release. Hosted CI compiles
-CUDA12/SM61 and CUDA13/SM75, including C99 headers and all three GPU test
+CUDA12/SM61 and CUDA13/SM75, including C99 headers and all four GPU test
 programs; hosted compilation is not counted as actual GPU test execution.
 
 Metadata records the explicitly compiled architecture range. Only SM61 has
@@ -79,9 +88,9 @@ between two compiled SASS targets has a compatible image.
 ## Sign and install
 
 ```sh
-guild kernel sign build/package --key-id YOUR-KEY-ID --seed-file /secure/release.seed --bundle build/cuda-1.2.0.gkernel
+guild kernel sign build/package --key-id YOUR-KEY-ID --seed-file /secure/release.seed --bundle build/cuda-1.3.0.gkernel
 guild kernel trust-key --publisher org.guild-inference --key-id YOUR-KEY-ID --pubkey YOUR-PUBLIC-KEY
-guild kernel install build/cuda-1.2.0.gkernel
+guild kernel install build/cuda-1.3.0.gkernel
 guild kernel active --json
 ```
 
