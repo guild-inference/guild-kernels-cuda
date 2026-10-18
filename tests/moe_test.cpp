@@ -42,6 +42,20 @@ int main() {
     CHECK(table.elementwise(&bad_ctx, &invalid, &error) == GUILD_STATUS_ERR_ABI_MISMATCH);
     bad_ctx = ctx; bad_ctx.backend = GUILD_BACKEND_CPU;
     CHECK(table.elementwise(&bad_ctx, &invalid, &error) == GUILD_STATUS_ERR_INVALID_ARGUMENT);
+    bad_ctx = ctx; bad_ctx.device_id = -1;
+    CHECK(table.elementwise(&bad_ctx, &invalid, &error) == GUILD_STATUS_ERR_INVALID_ARGUMENT);
+
+    guild_cuda_sampler_op_v1_t bad_samp{};
+    bad_samp.struct_size = sizeof(bad_samp);
+    bad_samp.mode = GUILD_CUDA_SAMPLER_SAMPLE_TOKENS_V1;
+    bad_samp.params.struct_size = sizeof(uint32_t);
+    CHECK(table.sampler(&ctx, &bad_samp, &error) == GUILD_STATUS_ERR_ABI_MISMATCH);
+
+    guild_cuda_qwen_op_v1_t bad_qwen{};
+    bad_qwen.struct_size = sizeof(bad_qwen);
+    bad_qwen.mode = GUILD_CUDA_QWEN_GR_WRITE_V1;
+    bad_qwen.gr_shapes.struct_size = sizeof(uint32_t);
+    CHECK(table.qwen(&ctx, &bad_qwen, &error) == GUILD_STATUS_ERR_ABI_MISMATCH);
 
     // 1. Configure flags + queries
     int32_t val = -1;

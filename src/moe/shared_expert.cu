@@ -84,7 +84,7 @@ __global__ void native_swiglu_kernel(const float* gate, const float* up, float* 
     out[i] = __fdividef(gate[i], 1.0f + __expf(-gate[i])) * up[i];
 }
 
-__global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n) {
+[[maybe_unused]] __global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = f16_from_f32(in[i]);
 }
@@ -151,7 +151,7 @@ __global__ void native_scalar_sigmoid_kernel(float* gate) {
     // compilation flags. The dot product was already reduced by the pinned native MMVF implementation.
     gate[0] = __fdividef(1.0f, 1.0f + __expf(-gate[0]));
 }
-__global__ void native_scalar_sigmoid_multi_kernel(float* gate) {   // thread t = token t, same expression
+[[maybe_unused]] __global__ void native_scalar_sigmoid_multi_kernel(float* gate) {   // thread t = token t, same expression
     gate[threadIdx.x] = __fdividef(1.0f, 1.0f + __expf(-gate[threadIdx.x]));
 }
 

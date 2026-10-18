@@ -76,7 +76,10 @@ constexpr int kMropeDevices = 64;
 std::atomic<const int32_t*> mrope_tab[kMropeDevices] = {};
 int mrope_dev() {
     int d = 0;
-    if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= kMropeDevices) d = 0;
+    if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= kMropeDevices) {
+        cudaGetLastError();
+        d = 0;
+    }
     return d;
 }
 }  // namespace

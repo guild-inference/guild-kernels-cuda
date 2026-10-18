@@ -333,7 +333,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
 // card's opt-in limit at kFusedGrMaxT tokens (Ampere 99 KB: S = 1; Turing / HIP 64 KB: S = 2); a card where
 // neither fits keeps the default kernels.
 constexpr int PR = LR + HC;                        // partial rows per (token, stream): 320 down + 4 inject
-constexpr int TQ3 = N / 8 / 32;                    // uint4 weight chunks per lane in one stream's slice (10)
+[[maybe_unused]] constexpr int TQ3 = N / 8 / 32;   // uint4 weight chunks per lane in one stream's slice (10)
 
 template <int S, int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
 __global__ void __launch_bounds__(THREADS) gr_down_v3_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
@@ -1340,7 +1340,10 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
 
 int fused_gr_variant() {
     int dev = 0;
-    cudaGetDevice(&dev);
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        cudaGetLastError();
+        dev = -1;
+    }
     const int v = dev >= 0 && dev < 64 ? g_variant[dev].load() : 0;
     if (v > 0) return v;
     // not checked on this card: the plain read, unless GUILD_HC_SPLIT names a variant (a test such as gr_parity)
@@ -1350,8 +1353,10 @@ int fused_gr_variant() {
 
 void fused_gr_check() {
     int dev = 0;
-    cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64 || g_variant[dev].load() > 0) return;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || g_variant[dev].load() > 0) {
+        cudaGetLastError();
+        return;
+    }
     const int want = env_variant();
     if (want == kHcPlain) {
         g_variant[dev].store(kHcPlain);

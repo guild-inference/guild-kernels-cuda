@@ -124,7 +124,7 @@ __device__ float block_sumf(float v, double* scratch_raw) {
 /// The leading `__syncthreads()` is not decoration: the result is read straight out of `scratch[0]` by every
 /// thread, and a later call reuses the same array.  Without a barrier on entry a fast thread can overwrite
 /// `scratch[0]` before a slow one has read the previous result - a race that is invisible in most runs.
-__device__ double block_sum(double v, double* scratch) {
+[[maybe_unused]] __device__ double block_sum(double v, double* scratch) {
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     v = warp_sum(v);

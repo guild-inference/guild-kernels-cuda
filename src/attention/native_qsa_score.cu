@@ -31,7 +31,8 @@
 namespace GUILD_CUDA_ATTN_MATH_NS {
 namespace {
 std::atomic<bool> enabled{false};
-constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
+constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2;
+[[maybe_unused]] constexpr int STRIDE=36, COMBINE=68;
 struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
 struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };

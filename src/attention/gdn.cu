@@ -35,7 +35,7 @@ constexpr int JTHREADS = 32;   ///< threads along j, the state's fast axis
 constexpr int MAX_H = 1;       ///< heads staged in shared memory per block
 
 /// ggml_compute_softplus_f32: log1p(exp(x)), with the large-x branch that avoids overflow.
-__device__ __forceinline__ float softplus_f(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+[[maybe_unused]] __device__ __forceinline__ float softplus_f(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 /// One step of the recurrence.  One thread per (h, j) column of the state.

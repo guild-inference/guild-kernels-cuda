@@ -87,8 +87,8 @@ void* checked_stream(const guild_exec_context_v1_t* ctx, const char* name) {
     if (GUILD_KERNEL_ABI_VERSION_MAJOR_OF(ctx->abi_version) != GUILD_KERNEL_ABI_VERSION_MAJOR) {
         throw AbiMismatch(std::string(name) + ": incompatible exec context ABI");
     }
-    if (ctx->backend != GUILD_BACKEND_CUDA) {
-        throw std::invalid_argument(std::string(name) + ": expected CUDA exec context");
+    if (ctx->backend != GUILD_BACKEND_CUDA || ctx->device_id < 0) {
+        throw std::invalid_argument(std::string(name) + ": expected valid CUDA exec context and non-negative device_id");
     }
     return ctx->device_stream;
 }
@@ -102,7 +102,16 @@ const Command& checked(const Command* cmd, const char* name) {
     return *cmd;
 }
 
+template <class Nested>
+void check_nested(const Nested& s, const char* name, bool allow_zero = false) {
+    if (allow_zero && s.struct_size == 0) return;
+    if (s.struct_size < sizeof(Nested)) {
+        throw AbiMismatch(std::string(name) + ": nested struct_size is too small");
+    }
+}
+
 math::SForm make_sform(const guild_cuda_sform_v1_t& f) {
+    check_nested(f, "sform", true);
     math::SForm out{};
     out.code_bits = f.code_bits;
     out.code_bias = f.code_bias;
@@ -113,7 +122,22 @@ math::SForm make_sform(const guild_cuda_sform_v1_t& f) {
     return out;
 }
 
+math::NativeSharedWeights make_native_shared(const guild_cuda_native_shared_weights_v1_t& ns) {
+    check_nested(ns, "native_shared");
+    math::NativeSharedWeights nw{};
+    nw.gate_type = ns.gate_type;
+    nw.up_type = ns.up_type;
+    nw.down_type = ns.down_type;
+    nw.gate_data = ns.gate_data;
+    nw.up_data = ns.up_data;
+    nw.down_data = ns.down_data;
+    nw.q8_1 = ns.q8_1;
+    nw.x_q8_1 = ns.x_q8_1;
+    return nw;
+}
+
 math::PleWeights make_ple_weights(const guild_cuda_ple_weights_v1_t& pw) {
+    check_nested(pw, "ple_weights");
     math::PleWeights w{};
     w.key_codes = pw.key_codes;
     w.key_scales = pw.key_scales;
@@ -130,6 +154,7 @@ math::PleWeights make_ple_weights(const guild_cuda_ple_weights_v1_t& pw) {
 }
 
 math::PleOut make_ple_out(const guild_cuda_ple_out_v1_t& po) {
+    check_nested(po, "ple_out");
     math::PleOut out{};
     out.key = po.key;
     out.value = po.value;
@@ -142,6 +167,7 @@ math::PleOut make_ple_out(const guild_cuda_ple_out_v1_t& po) {
 }
 
 math::FusedGrArgs make_fused_gr_args(const guild_cuda_fused_gr_args_v1_t& fa) {
+    check_nested(fa, "fused_gr_args");
     math::FusedGrArgs a{};
     a.R = fa.R;
     a.R_out = fa.R_out;
@@ -366,14 +392,7 @@ guild_status_t moe_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_moe_o
                 math::NativeSharedWeights nw{};
                 const math::NativeSharedWeights* nwp = nullptr;
                 if (c.has_native_shared) {
-                    nw.gate_type = c.native_shared.gate_type;
-                    nw.up_type = c.native_shared.up_type;
-                    nw.down_type = c.native_shared.down_type;
-                    nw.gate_data = c.native_shared.gate_data;
-                    nw.up_data = c.native_shared.up_data;
-                    nw.down_data = c.native_shared.down_data;
-                    nw.q8_1 = c.native_shared.q8_1;
-                    nw.x_q8_1 = c.native_shared.x_q8_1;
+                    nw = make_native_shared(c.native_shared);
                     nwp = &nw;
                 }
                 math::shared_expert(c.x_q8_0, c.x_q8k, c.x_bf16, gf, c.gate_codes, c.gate_scales, c.gate_off, uf,
@@ -383,15 +402,7 @@ guild_status_t moe_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_moe_o
                 break;
             }
             case GUILD_CUDA_MOE_SHARED_EXPERT_MULTI_V1: {
-                math::NativeSharedWeights nw{};
-                nw.gate_type = c.native_shared.gate_type;
-                nw.up_type = c.native_shared.up_type;
-                nw.down_type = c.native_shared.down_type;
-                nw.gate_data = c.native_shared.gate_data;
-                nw.up_data = c.native_shared.up_data;
-                nw.down_data = c.native_shared.down_data;
-                nw.q8_1 = c.native_shared.q8_1;
-                nw.x_q8_1 = c.native_shared.x_q8_1;
+                const math::NativeSharedWeights nw = make_native_shared(c.native_shared);
                 math::shared_expert_multi(c.n_tokens, c.x_f32, c.x_bf16, nw, c.gate_inp_bf16, c.gate_buf, c.up_buf,
                                           c.g_buf, c.out, c.n_embd, c.n_ff, stream);
                 break;
@@ -525,6 +536,7 @@ guild_status_t sampler_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_s
         const auto& c = checked(raw, "sampler");
         switch (c.mode) {
             case GUILD_CUDA_SAMPLER_SAMPLE_TOKENS_V1: {
+                check_nested(c.params, "sampler_params");
                 math::SamplerParams p{};
                 p.top_k = c.params.top_k;
                 p.top_p = c.params.top_p;
@@ -646,6 +658,8 @@ guild_status_t qwen_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_qwen
         const auto& c = checked(raw, "qwen");
         switch (c.mode) {
             case GUILD_CUDA_QWEN_GR_READ_V1: {
+                check_nested(c.gr_shapes, "gr_shapes");
+                check_nested(c.gr_ws, "gr_ws");
                 const math::GrShapes s{c.gr_shapes.n_embd, c.gr_shapes.hc, c.gr_shapes.hc_lr};
                 const math::GrWorkspace ws{c.gr_ws.xn, c.gr_ws.xq, c.gr_ws.lq, c.gr_ws.gated, c.gr_ws.lo,
                                            (size_t) c.gr_ws.bytes};
@@ -653,6 +667,7 @@ guild_status_t qwen_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_qwen
                 break;
             }
             case GUILD_CUDA_QWEN_GR_WRITE_V1: {
+                check_nested(c.gr_shapes, "gr_shapes");
                 const math::GrShapes s{c.gr_shapes.n_embd, c.gr_shapes.hc, c.gr_shapes.hc_lr};
                 math::gr_write(c.R, c.block_out, c.inject, s, c.R_out, stream);
                 break;
@@ -677,13 +692,16 @@ guild_status_t qwen_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_qwen
                 math::native_gr_rms_norm_weighted(c.R, c.w_norm, c.R_out, c.n_cols, c.n_rows, c.eps, stream);
                 break;
             case GUILD_CUDA_QWEN_NATIVE_GR_DOWN_SILU_V1:
+                check_nested(c.gr_shapes, "gr_shapes");
                 math::native_gr_down_silu(c.R_out, (int) c.gr_shapes.hc_lr, (int) c.gr_shapes.hc, stream);
                 break;
             case GUILD_CUDA_QWEN_NATIVE_GR_PRE_GATED_V1:
+                check_nested(c.gr_shapes, "gr_shapes");
                 math::native_gr_pre_gated(c.R, c.gated, c.mixed, (int) c.gr_shapes.n_embd, (int) c.gr_shapes.hc,
                                           c.fused_layer != 0, stream);
                 break;
             case GUILD_CUDA_QWEN_NATIVE_GR_POST_V1:
+                check_nested(c.gr_shapes, "gr_shapes");
                 math::native_gr_post(c.R, c.block_out, c.inject, c.R_out, (int) c.gr_shapes.n_embd,
                                      (int) c.gr_shapes.hc, stream);
                 break;
@@ -705,6 +723,7 @@ guild_status_t qwen_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_qwen
                 break;
             case GUILD_CUDA_QWEN_NATIVE_PLE_POSTOPS_V1: {
                 const auto w = make_ple_weights(c.ple_weights);
+                check_nested(c.ple_buffers, "ple_buffers");
                 const math::NativePlePostopsBuffers b{c.ple_buffers.key,        c.ple_buffers.query,
                                                       c.ple_buffers.gate,       c.ple_buffers.gated,
                                                       c.ple_buffers.normalized, c.ple_buffers.conv,
@@ -719,6 +738,7 @@ guild_status_t qwen_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_qwen
                 break;
             }
             case GUILD_CUDA_QWEN_CVEC_APPLY_V1:
+                check_nested(c.gr_shapes, "gr_shapes");
                 math::cvec_launch_kernel(c.R_out, c.cvec_dir, c.cvec_s, c.cvec_on, c.cvec_mode, c.layer, c.n_tok,
                                          c.gr_shapes.n_embd, c.gr_shapes.hc, c.r_ld, c.block_out, c.bo_ld, c.inject,
                                          c.inj_ld, c.write != 0, stream);
