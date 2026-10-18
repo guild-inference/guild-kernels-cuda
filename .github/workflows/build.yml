@@ -23,11 +23,14 @@ jobs:
     steps:
       - run: apt-get update && apt-get install -y git g++ python3-pip && pip3 install cmake==3.28.4
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: guild-inference/Guild
-          ref: 098e80d6eec18a9e7a58f0d6aeacb4ea9c48995a
+          ref: 5120817d35d2e1575a7d8e71c2b4610e97e425b3
           path: sdk-source
+          persist-credentials: false
       - run: cmake -S sdk-source/sdk -B sdk-build -DCMAKE_INSTALL_PREFIX=/opt/guild-sdk && cmake --install sdk-build
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/guild-sdk -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.sm }} && cmake --build build -j2
       - run: cmake --install build --prefix "$PWD/build/package"
