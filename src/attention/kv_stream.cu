@@ -90,6 +90,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     if (threadIdx.x == 0) { s_nmiss = 0; s_lookups = 0; }
     __syncthreads();
     // 1. hits take this epoch and their reference bit; a missing block is claimed exactly once (-1 -> -2)
+    const bool direct_map = m.n_slots >= m.n_blocks;
     int lookups = 0;
     for (int q = 0; q < n_q; ++q) {
         const int width = steps[q * kStepCount + kStepWidth];
@@ -100,8 +101,10 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
             ++lookups;
             const int sl = m.page_table[b];
             if (sl >= 0) {
-                m.slot_stamp[sl] = epoch;
-                m.slot_ref[sl] = 1;
+                if (!direct_map) {
+                    m.slot_stamp[sl] = epoch;
+                    m.slot_ref[sl] = 1;
+                }
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
                 m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
             }
@@ -112,42 +115,52 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     // 2. one victim per miss: a clock sweep from the hand. A slot this call uses (stamp == epoch) is never taken;
     //    a referenced one loses its bit as the hand passes it and is taken on the next pass.
     const int need = s_nmiss, n = (int) m.n_slots;
-    int hand = m.ctl[1], got = 0;
-    for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
-        const int j = (int) (((long long) hand + threadIdx.x) % n);
-        const bool mine = m.slot_stamp[j] == epoch;
-        const bool cand = !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
-        int total = 0;
-        const int rank = block_scan(cand ? 1 : 0, warp_sums, total);
-        const int want = need - got;
-        if (threadIdx.x == 0) s_cut = RT;
-        __syncthreads();
-        if (cand && rank == want - 1) s_cut = threadIdx.x + 1;   // the hand stops just past the last slot taken
-        __syncthreads();
-        const int cut = s_cut;
-        if (cand && rank < want) {
-            m.miss_slot[got + rank] = j;
-            m.slot_stamp[j] = epoch;   // taken: a sweep that wraps around must not take it twice
-        } else if (threadIdx.x < cut && !mine) {
-            m.slot_ref[j] = 0;
+    int hand = m.ctl[1], got = direct_map ? need : 0;
+    if (direct_map) {
+        for (int k = threadIdx.x; k < need; k += RT) {
+            const int b = m.miss_block[k];
+            m.miss_slot[k] = b;
+            m.slot_block[b] = b;
+            m.page_table[b] = b;
         }
-        got += total < want ? total : want;
-        hand = (int) (((long long) hand + cut) % n);
-        __syncthreads();
+    } else {
+        for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
+            const int j = (int) (((long long) hand + threadIdx.x) % n);
+            const bool mine = m.slot_stamp[j] == epoch;
+            const bool cand = !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
+            int total = 0;
+            const int rank = block_scan(cand ? 1 : 0, warp_sums, total);
+            const int want = need - got;
+            if (threadIdx.x == 0) s_cut = RT;
+            __syncthreads();
+            if (cand && rank == want - 1) s_cut = threadIdx.x + 1;   // the hand stops just past the last slot taken
+            __syncthreads();
+            const int cut = s_cut;
+            if (cand && rank < want) {
+                m.miss_slot[got + rank] = j;
+                m.slot_stamp[j] = epoch;   // taken: a sweep that wraps around must not take it twice
+            } else if (threadIdx.x < cut && !mine) {
+                m.slot_ref[j] = 0;
+            }
+            got += total < want ? total : want;
+            hand = (int) (((long long) hand + cut) % n);
+            __syncthreads();
+        }
+        // 3. re-point the table; the copy kernel fills the slots
+        const int placed = got < need ? got : need;
+        for (int k = threadIdx.x; k < need; k += RT) {
+            const int b = m.miss_block[k];
+            if (k >= placed) { m.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots
+            const int sl = m.miss_slot[k];
+            const int old = m.slot_block[sl];
+            if (old >= 0) m.page_table[old] = -1;
+            m.slot_block[sl] = b;
+            m.slot_stamp[sl] = epoch;
+            m.slot_ref[sl] = 1;
+            m.page_table[b] = sl;
+        }
     }
-    // 3. re-point the table; the copy kernel fills the slots
     const int placed = got < need ? got : need;
-    for (int k = threadIdx.x; k < need; k += RT) {
-        const int b = m.miss_block[k];
-        if (k >= placed) { m.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots
-        const int sl = m.miss_slot[k];
-        const int old = m.slot_block[sl];
-        if (old >= 0) m.page_table[old] = -1;
-        m.slot_block[sl] = b;
-        m.slot_stamp[sl] = epoch;
-        m.slot_ref[sl] = 1;
-        m.page_table[b] = sl;
-    }
     if (threadIdx.x == 0) {
         m.ctl[0] = epoch;
         m.ctl[1] = hand;
@@ -163,9 +176,12 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
 __global__ void copy_kernel(KvStreamMap m, Runs r) {
     const int need = m.ctl[2];
+    if (need <= 0) return;
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
-        for (int a = 0; a < r.n; ++a) {
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+            if (a >= r.n) break;
             const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
             uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
             for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];

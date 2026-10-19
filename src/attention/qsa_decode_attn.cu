@@ -106,7 +106,6 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
     const int n_here = min(CHUNK, n_ids - c0);
     const int slot = kvh * n_chunks + chunk;
     if (n_here <= 0) {
-        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
         return;
     }
     for (int i = t; i < G * HD; i += THREADS) sq[i / HD][i % HD] = q[(size_t) (kvh * G) * HD + i];
@@ -286,7 +285,6 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
     const int n_here = min(CHUNK, n_ids - c0);
     const int slot = kvh * n_chunks + chunk;
     if (n_here <= 0) {
-        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
         return;
     }
     for (int i = t; i < G * HD; i += THREADS) sq[i / HD][i % HD] = q[(size_t) (kvh * G) * HD + i];
@@ -418,19 +416,22 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
 template <int G>
 __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict__ part_acc,
                                                         const float* __restrict__ part_m,
-                                                        const float* __restrict__ part_l, int n_chunks,
+                                                        const float* __restrict__ part_l,
+                                                        const int32_t* __restrict__ step, int n_chunks,
                                                         float* __restrict__ attn, long long scratch_stride = 0) {
     part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
     part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
     part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
     attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
+    const int n_ids = __ldg(step + (size_t) blockIdx.y * kStepCount + kStepWidth);
+    const int active_chunks = min(n_chunks, (n_ids + CHUNK - 1) / CHUNK);
     const int h = blockIdx.x;                 // global query head
     const int kvh = h / G, hl = h % G;
     const int d = threadIdx.x;
     float M = -FLT_MAX;
-    for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, part_m[(kvh * n_chunks + c) * G + hl]);
+    for (int c = 0; c < active_chunks; ++c) M = fmaxf(M, part_m[(kvh * n_chunks + c) * G + hl]);
     float L = 0.0f, acc = 0.0f;
-    for (int c = 0; c < n_chunks; ++c) {
+    for (int c = 0; c < active_chunks; ++c) {
         const int slot = kvh * n_chunks + c;
         const float m = part_m[slot * G + hl];
         if (m == -FLT_MAX) continue;
@@ -570,7 +571,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 #define DISPATCH_BATCH(GV) \
     case GV: \
         dispatch_attn_chunk_batch<GV>(kv_mode, grid, st, q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, actual_id_stride, stride); \
-        attn_merge_kernel<GV><<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn, stride); \
+        attn_merge_kernel<GV><<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, steps, n_chunks, attn, stride); \
         break;
 
     switch (G_val) {
@@ -622,7 +623,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 #define DISPATCH_STEP(GV) \
     case GV: \
         dispatch_attn_chunk_step<GV>(kv_mode, grid, st, q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks); \
-        attn_merge_kernel<GV><<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn); \
+        attn_merge_kernel<GV><<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, step, n_chunks, attn); \
         break;
 
     switch (G_val) {
