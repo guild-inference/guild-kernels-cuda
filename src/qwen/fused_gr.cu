@@ -521,12 +521,18 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 //    weights are loaded while the current one is used.  A tile is 160 = 5 x 32 chunks of 8, so a lane still
 //    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Before sm_80
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
+//  - before sm_70, staged runs 512-float tiles and the two-plane up kernel (gr_up_planes_kernel).  Two 1280-float
+//    tiles per token are 40 KB at four tokens, so a Pascal SM (96 KB) held two of the 41 blocks and five tokens took
+//    two launches, each reading all of w_down; at 512 floats eight tokens fit 32 KB in one launch.  The lane order is
+//    the same for any tile of whole rounds of 32 chunks.  On a GTX 1070 the read of 1-8 tokens took 85 / 96 / 111 /
+//    151 / 204 / 224 / 240 / 282 us with the 1280 tile and gr_up_multi_kernel, 81 / 90 / 104 / 115 / 132 / 146 /
+//    157 / 174 with these.
 constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;
 constexpr int H_TILE = 1280;                          // staged tile: half a stream = 160 chunks of 8, 5 per lane
-constexpr int HQ = H_TILE / 8 / 32;
-constexpr int N_HTILES = D / H_TILE;                  // 8
-static_assert(N % H_TILE == 0, "a staged tile never straddles two streams");
-static_assert(H_TILE % 256 == 0, "a staged tile holds whole rounds of 32 chunks: the plain read's lane order");
+constexpr int P_TILE = 512;                           // the staged tile before sm_70: 64 chunks of 8, 2 per lane
+static_assert(N % H_TILE == 0 && N % P_TILE == 0, "a staged tile never straddles two streams");
+static_assert(H_TILE % 256 == 0 && P_TILE % 256 == 0,
+              "a staged tile holds whole rounds of 32 chunks: the plain read's lane order");
 
 __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
     __shared__ float part[WARPS];
@@ -617,17 +623,20 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
 }
 
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
+template <int TILE>
 __device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t) {
-    for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
-        const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
-        const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
-        cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
+    for (int i = t; i < T * (TILE / 4); i += THREADS) {
+        const int k = i / (TILE / 4), s4 = i - k * (TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
+        const float* src = m.xn + (size_t) k * D + (size_t) h * TILE + (size_t) s4 * 4;
+        cp_async16(buf + (size_t) k * (TILE / 4) + (s4 & 1) * (TILE / 8) + (s4 >> 1), src);
     }
 }
 
-template <int MAX_T = kFusedGrMaxT>
+template <int TILE = H_TILE, int MAX_T = kFusedGrMaxT>
 __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
-    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+    constexpr int HQ = TILE / 8 / 32;                    // uint4 weight chunks per lane per tile
+    constexpr int N_HTILES = D / TILE;
+    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][TILE / 8] float4
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = m.T;
     const bool inject_block = blockIdx.x == DOWN_BLOCKS;
@@ -635,7 +644,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
     const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
     const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
     const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
-    const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
+    const size_t buf_f4 = (size_t) T * (TILE / 4);    // float4 per buffer (the second one follows the first)
     float acc[MAX_T];
 #pragma unroll
     for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
@@ -644,15 +653,15 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
 #pragma unroll
         for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
     }
-    stage_htile(m, T, 0, hbuf, t);
+    stage_htile<TILE>(m, T, 0, hbuf, t);
     cp_async_commit();
-    stage_htile(m, T, 1, hbuf + buf_f4, t);
+    stage_htile<TILE>(m, T, 1, hbuf + buf_f4, t);
     cp_async_commit();
 #pragma unroll 1
     for (int h = 0; h < N_HTILES; ++h) {
         if (active && h + 1 < N_HTILES) {
 #pragma unroll
-            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (TILE / 8) + lane + 32 * q);
         }
         if (h + 1 < N_HTILES) cp_async_wait1();         // tile h has landed (h + 1 may still be on its way)
         else cp_async_wait0();
@@ -665,14 +674,14 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
 #pragma unroll
                 for (int k = 0; k < MAX_T; ++k) {
                     if (k < T) {
-                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
-                        acc[k] += dot8v(wv[q], pk[j], pk[H_TILE / 8 + j]);
+                        const float4* pk = cur + (size_t) k * (TILE / 4);
+                        acc[k] += dot8v(wv[q], pk[j], pk[TILE / 8 + j]);
                     }
                 }
             }
         }
         __syncthreads();                                // every warp is done with buffer h & 1
-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+        if (h + 2 < N_HTILES) stage_htile<TILE>(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
         if (h + 1 < N_HTILES) {
 #pragma unroll
@@ -696,11 +705,72 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
     }
 }
 
+// gr_up_multi_kernel for the staged read before sm_70: 8 columns per block (320 blocks; 160 of 16 left a third of a
+// second wave on 15 SMs), and lo in shared memory as two planes (floats 0-3 and 4-7 of every chunk of 8) so a warp's
+// float4 reads hit no bank twice.  dot8v is dot8's eight fmaf in its order and each (row, token) is still one warp's
+// xor sum of the same lane partials: the same bits.
+constexpr int PUP_COLS = 8;
+__global__ void __launch_bounds__(THREADS) gr_up_planes_kernel(GrMulti m) {
+    constexpr int RPW = HC * PUP_COLS / WARPS;          // rows per warp
+    __shared__ __align__(16) float4 lo4[kFusedGrMaxT][2][LR / 8];
+    __shared__ float g[kFusedGrMaxT][HC][PUP_COLS];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int d0 = blockIdx.x * PUP_COLS;
+    for (int i = t; i < T * LR; i += THREADS) {
+        const int k = i / LR, e = i - k * LR;
+        reinterpret_cast<float*>(&lo4[k][(e & 7) >> 2][e >> 3])[e & 3] = m.a[k].lo[e];
+    }
+    __syncthreads();
+    for (int j = 0; j < RPW; ++j) {
+        const int r = warp * RPW + j, c = r / PUP_COLS, dd = r - c * PUP_COLS, i = c * N + d0 + dd;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+        const uint4 wa = __ldg(w4 + lane);
+        const uint4 wb = lane < LR / 8 - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0);
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            float acc = dot8v(wa, lo4[k][0][lane], lo4[k][1][lane]);
+            if (lane < LR / 8 - 32) acc += dot8v(wb, lo4[k][0][32 + lane], lo4[k][1][32 + lane]);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * PUP_COLS; i += THREADS) {
+        const int k = i / PUP_COLS, col = i - k * PUP_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+}
+
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
 // stages n_tok * TILEV floats (1280 on sm_75, 2560 elsewhere), staged two tiles of n_tok * H_TILE.  The shared-memory
 // opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
-int down_chunk(bool staged, int* tile_out) {
+int down_chunk(bool staged, int* tile_out, int* staged_tile_out = nullptr) {
     static bool attr[64] = {};
+    static int staged_tile[64] = {};   // the staged kernel's tile on this card: P_TILE before sm_70, H_TILE elsewhere
     static int chunk[64] = {};   // tokens the plain down kernel may carry in one launch on this card
     static int chunk_staged[64] = {};  // the same for staged
     static int tile[64] = {};    // the plain down kernel's TILEV on this card (1280 on sm_75, 2560 elsewhere)
@@ -708,6 +778,7 @@ int down_chunk(bool staged, int* tile_out) {
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) {
         *tile_out = 2560;
+        if (staged_tile_out) *staged_tile_out = H_TILE;
         return kFusedGrMaxT;
     }
     if (!attr[dev]) {
@@ -741,6 +812,12 @@ int down_chunk(bool staged, int* tile_out) {
         } else {
             cudaFuncSetAttribute(gr_down_multi_kernel<2560>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
         }
+#if defined(__HIPCC__)
+        const int st_tile = H_TILE;
+#else
+        const int st_tile = guild::cc_major_of(cc_maj) < 7 ? P_TILE : H_TILE;
+#endif
+        staged_tile[dev] = st_tile;
         int want_staged = (int) (2 * kFusedGrMaxT * H_TILE * sizeof(float));
         if (optin > 0 && want_staged > optin) want_staged = optin;
         cudaFuncSetAttribute(gr_down_staged_kernel<>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
@@ -760,11 +837,12 @@ int down_chunk(bool staged, int* tile_out) {
 #endif
         const int capacity = usable / (int) (tv * sizeof(float));
         chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
-        const int capacity_staged = usable / (int) (2 * H_TILE * sizeof(float));
+        const int capacity_staged = usable / (int) (2 * st_tile * sizeof(float));
         chunk_staged[dev] = capacity_staged < 1 ? 1 : (capacity_staged > kFusedGrMaxT ? kFusedGrMaxT : capacity_staged);
         attr[dev] = true;
     }
     *tile_out = tile[dev] ? tile[dev] : 2560;
+    if (staged_tile_out) *staged_tile_out = staged_tile[dev] ? staged_tile[dev] : H_TILE;
     return staged ? chunk_staged[dev] : chunk[dev];
 }
 
@@ -794,9 +872,10 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
 #endif
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     const bool staged = variant >= kHcStaged;
-    int tv = 2560;
-    const int chunk_tok = down_chunk(staged, &tv);
-    const size_t per_tok = (staged ? (size_t) 2 * H_TILE : (size_t) tv) * sizeof(float);
+    int tv = 2560, st_tile = H_TILE;
+    const int chunk_tok = down_chunk(staged, &tv, &st_tile);
+    const bool p_tile = staged && st_tile == P_TILE;
+    const size_t per_tok = (staged ? (size_t) 2 * st_tile : (size_t) tv) * sizeof(float);
     for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
         const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
         GrMulti c{};
@@ -813,8 +892,11 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // (read once: this runs per layer when decode is not captured)
         static const bool max4_on = [] { const char* v = std::getenv("GUILD_GR_DOWN_MAX4"); return v && std::atoi(v) != 0; }();
         const bool max4 = max4_on && ct <= 4;
-        if (staged) {
-            if (max4) gr_down_staged_kernel<4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+        if (p_tile) {
+            if (max4) gr_down_staged_kernel<P_TILE, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            else gr_down_staged_kernel<P_TILE><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+        } else if (staged) {
+            if (max4) gr_down_staged_kernel<H_TILE, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
             else gr_down_staged_kernel<><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
         } else if (tv == 1280) {
             if (max4) gr_down_multi_kernel<1280, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
@@ -829,7 +911,8 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
 #endif
-    gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    if (p_tile) gr_up_planes_kernel<<<N / PUP_COLS, THREADS, 0, st>>>(m);
+    else gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
 }
 
 /// GUILD_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read
@@ -1382,7 +1465,10 @@ void fused_gr_check() {
         "", "the plain read (the norm per token, the down projection on 41 blocks)",
         "split (the norm per token and stream, then the plain read's down projection)",
         "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)"};
-    std::fprintf(stderr, "guild hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
+    int tv = 0, st_tile = H_TILE;
+    down_chunk(true, &tv, &st_tile);
+    std::fprintf(stderr, "guild hc: CUDA%d: the hyper-connection read runs as %s%s%s\n", dev, what[use],
+                 use == kHcStaged && st_tile == P_TILE ? " in 512-float tiles, with the two-plane up kernel" : "",
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (GUILD_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");
 }
