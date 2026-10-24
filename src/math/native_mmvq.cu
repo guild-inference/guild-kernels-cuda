@@ -36,6 +36,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace GUILD_CUDA_DENSE_MATH_NS {
 #ifndef GUILD_CUDA_MOE_MATH_NS
@@ -849,20 +850,28 @@ struct Q5KTraits {
         return r;
     }
     __device__ static float apply(const W& r, const Q81Block* __restrict__ bq8, int iqs) {
+        return dot(r, load_x(bq8, iqs));
+    }
+    // The activation load and the product apart, so a block of several rows loads each column once
+    // (native_mmvq_multi_xr_kernel).
+    struct X { int u[4]; float d8[2]; };
+    __device__ static X load_x(const Q81Block* __restrict__ bq8, int iqs) {
         const int bq8_offset = 2 * ((iqs / 2) / 4);
-        int u[4];
-        float d8[2];
+        X v;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const Q81Block* bq8i = bq8 + bq8_offset + i;
-            d8[i] = __low2float(bq8i->ds);
+            v.d8[i] = __low2float(bq8i->ds);
             const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
-            u[2 * i] = q8[0];
-            u[2 * i + 1] = q8[4];
+            v.u[2 * i] = q8[0];
+            v.u[2 * i + 1] = q8[4];
         }
+        return v;
+    }
+    __device__ static float dot(const W& r, const X& v) {
         const uint8_t sc[2] = {uint8_t(r.aux[0] & 0xffu), uint8_t(r.aux[0] >> 8)};
         const uint8_t m[2] = {uint8_t(r.aux[1] & 0xffu), uint8_t(r.aux[1] >> 8)};
-        return q5_q8_dot_impl(r.vl, r.vh, u, sc, m, r.dm, d8);
+        return q5_q8_dot_impl(r.vl, r.vh, v.u, sc, m, r.dm, v.d8);
     }
 };
 struct Q4KTraits {
@@ -889,20 +898,28 @@ struct Q4KTraits {
         return r;
     }
     __device__ static float apply(const W& r, const Q81Block* __restrict__ bq8, int iqs) {
+        return dot(r, load_x(bq8, iqs));
+    }
+    // The activation load and the product apart, so a block of several rows loads each column once
+    // (native_mmvq_multi_xr_kernel).
+    struct X { int u[4]; float d8[2]; };
+    __device__ static X load_x(const Q81Block* __restrict__ bq8, int iqs) {
         const int bq8_offset = 2 * ((iqs / 2) / 4);
-        int u[4];
-        float d8[2];
+        X v;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const Q81Block* bq8i = bq8 + bq8_offset + i;
-            d8[i] = __low2float(bq8i->ds);
+            v.d8[i] = __low2float(bq8i->ds);
             const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
-            u[2 * i] = q8[0];
-            u[2 * i + 1] = q8[4];
+            v.u[2 * i] = q8[0];
+            v.u[2 * i + 1] = q8[4];
         }
+        return v;
+    }
+    __device__ static float dot(const W& r, const X& v) {
         const uint8_t sc[2] = {uint8_t(r.aux[0] & 0xffu), uint8_t(r.aux[0] >> 8)};
         const uint8_t m[2] = {uint8_t(r.aux[1] & 0xffu), uint8_t(r.aux[1] >> 8)};
-        return q4_q8_dot_impl(r.v, u, sc, m, r.dm, d8);
+        return q4_q8_dot_impl(r.v, v.u, sc, m, r.dm, v.d8);
     }
 };
 struct Q20Traits {
@@ -1000,14 +1017,25 @@ struct Q6KTraits {
         return r;
     }
     __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        return dot(r, load_x(x, iqs));
+    }
+    // The activation load and the product apart, so a block of several rows loads each column once
+    // (native_mmvq_multi_xr_kernel).
+    struct X { int u[2]; float d8[2]; };
+    __device__ static X load_x(const Q81Block* __restrict__ x, int iqs) {
         const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
-        float sumf = 0.0f;
+        X v;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            const int u = reinterpret_cast<const int*>(x[bq8_offset + 2 * i].qs)[iqs % 8];
-            const float d8 = __low2float(x[bq8_offset + 2 * i].ds);
-            sumf += d8 * (GUILD_DP4A(r.vi[i], u, 0) * int(r.sc[i]));
+            v.u[i] = reinterpret_cast<const int*>(x[bq8_offset + 2 * i].qs)[iqs % 8];
+            v.d8[i] = __low2float(x[bq8_offset + 2 * i].ds);
         }
+        return v;
+    }
+    __device__ static float dot(const W& r, const X& v) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) sumf += v.d8[i] * (GUILD_DP4A(r.vi[i], v.u[i], 0) * int(r.sc[i]));
         return float(r.d) * sumf;
     }
 };
@@ -1025,16 +1053,30 @@ struct IQ4XSTraits {
         return r;
     }
     __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        return dot(r, load_x(x, iqs));
+    }
+    // The activation load and the product apart, so a block of several rows loads each column once
+    // (native_mmvq_multi_xr_kernel).
+    struct X { int u0[4], u1[4]; float d8; };
+    __device__ static X load_x(const Q81Block* __restrict__ x, int iqs) {
+        X v;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v.u0[j] = reinterpret_cast<const int*>(x[iqs / 4].qs)[j];
+            v.u1[j] = reinterpret_cast<const int*>(x[iqs / 4].qs)[j + 4];
+        }
+        v.d8 = __low2float(x[iqs / 4].ds);
+        return v;
+    }
+    __device__ static float dot(const W& r, const X& v) {
         int sumi = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int u0 = reinterpret_cast<const int*>(x[iqs / 4].qs)[j];
-            const int u1 = reinterpret_cast<const int*>(x[iqs / 4].qs)[j + 4];
-            sumi = GUILD_DP4A(r.v[j].x, u0, sumi);
-            sumi = GUILD_DP4A(r.v[j].y, u1, sumi);
+            sumi = GUILD_DP4A(r.v[j].x, v.u0[j], sumi);
+            sumi = GUILD_DP4A(r.v[j].y, v.u1[j], sumi);
         }
         sumi *= r.ls - 32;
-        const float d = r.dw * __low2float(x[iqs / 4].ds);
+        const float d = r.dw * v.d8;
         return d * sumi;
     }
 };
@@ -1067,14 +1109,29 @@ struct SmallTraits<Q40Block, 4> {
         return r;
     }
     __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        return dot(r, load_x(x, iqs));
+    }
+    // The activation load and the product apart, so a block of several rows loads each column once
+    // (native_mmvq_multi_xr_kernel).
+    struct X { int u0[2], u1[2]; float2 ds; };
+    __device__ static X load_x(const Q81Block* __restrict__ x, int iqs) {
+        X v;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            v.u0[i] = reinterpret_cast<const int*>(x->qs)[iqs + i];
+            v.u1[i] = reinterpret_cast<const int*>(x->qs)[iqs + i + 4];
+        }
+        v.ds = __half22float2(x->ds);
+        return v;
+    }
+    __device__ static float dot(const W& r, const X& v) {
         int sumi = 0;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            sumi = GUILD_DP4A(r.vi0[i], reinterpret_cast<const int*>(x->qs)[iqs + i], sumi);
-            sumi = GUILD_DP4A(r.vi1[i], reinterpret_cast<const int*>(x->qs)[iqs + i + 4], sumi);
+            sumi = GUILD_DP4A(r.vi0[i], v.u0[i], sumi);
+            sumi = GUILD_DP4A(r.vi1[i], v.u1[i], sumi);
         }
-        const float2 ds = __half22float2(x->ds);
-        return r.d * (sumi * ds.x - 4 * ds.y);
+        return r.d * (sumi * v.ds.x - 4 * v.ds.y);
     }
 };
 template<>
@@ -1107,14 +1164,29 @@ struct SmallTraits<Q50Block, 4> {
         return r;
     }
     __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        return dot(r, load_x(x, iqs));
+    }
+    // The activation load and the product apart, so a block of several rows loads each column once
+    // (native_mmvq_multi_xr_kernel).
+    struct X { int u0[2], u1[2]; float2 ds; };
+    __device__ static X load_x(const Q81Block* __restrict__ x, int iqs) {
+        X v;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            v.u0[i] = reinterpret_cast<const int*>(x->qs)[iqs + i];
+            v.u1[i] = reinterpret_cast<const int*>(x->qs)[iqs + i + 4];
+        }
+        v.ds = __half22float2(x->ds);
+        return v;
+    }
+    __device__ static float dot(const W& r, const X& v) {
         int sumi = 0;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            sumi = GUILD_DP4A(r.vi0[i], reinterpret_cast<const int*>(x->qs)[iqs + i], sumi);
-            sumi = GUILD_DP4A(r.vi1[i], reinterpret_cast<const int*>(x->qs)[iqs + i + 4], sumi);
+            sumi = GUILD_DP4A(r.vi0[i], v.u0[i], sumi);
+            sumi = GUILD_DP4A(r.vi1[i], v.u1[i], sumi);
         }
-        const float2 ds = __half22float2(x->ds);
-        return r.d * (sumi * ds.x - 8 * ds.y);
+        return r.d * (sumi * v.ds.x - 8 * v.ds.y);
     }
 };
 template<>
@@ -1127,14 +1199,20 @@ struct SmallTraits<Q80Block, 8> {
         return W{{load_int_b2(w->qs, iqs), load_int_b2(w->qs, iqs + 1)}, float(w->d)};
     }
     __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        return dot(r, load_x(x, iqs));
+    }
+    // The activation load and the product apart, so a block of several rows loads each column once
+    // (native_mmvq_multi_xr_kernel).
+    struct X { int u[2]; float d1; };
+    __device__ static X load_x(const Q81Block* __restrict__ x, int iqs) {
+        const int* q = reinterpret_cast<const int*>(x->qs) + iqs;
+        return X{{q[0], q[1]}, __low2float(x->ds)};
+    }
+    __device__ static float dot(const W& r, const X& v) {
         int sumi = 0;
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const int u = reinterpret_cast<const int*>(x->qs)[iqs + i];
-            sumi = GUILD_DP4A(r.v[i], u, sumi);
-        }
-        const float d1 = __low2float(x->ds);
-        return r.d0 * d1 * float(sumi);
+        for (int i = 0; i < 2; ++i) sumi = GUILD_DP4A(r.v[i], v.u[i], sumi);
+        return r.d0 * v.d1 * float(sumi);
     }
 };
 template<>
@@ -1151,14 +1229,30 @@ struct SmallTraits<IQ4NLBlock, 4> {
         return r;
     }
     __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        return dot(r, load_x(x, iqs));
+    }
+    // The activation load and the product apart, so a block of several rows loads each column once
+    // (native_mmvq_multi_xr_kernel).
+    struct X { int q0[2], q1[2]; float d8; };
+    __device__ static X load_x(const Q81Block* __restrict__ x, int iqs) {
         const int* q8 = reinterpret_cast<const int*>(x->qs) + iqs;
+        X v;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            v.q0[i] = q8[i];
+            v.q1[i] = q8[i + 4];
+        }
+        v.d8 = __low2float(x->ds);
+        return v;
+    }
+    __device__ static float dot(const W& r, const X& v) {
         int sumi = 0;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            sumi = GUILD_DP4A(r.v[i].x, q8[i], sumi);
-            sumi = GUILD_DP4A(r.v[i].y, q8[i + 4], sumi);
+            sumi = GUILD_DP4A(r.v[i].x, v.q0[i], sumi);
+            sumi = GUILD_DP4A(r.v[i].y, v.q1[i], sumi);
         }
-        const float d = r.dw * __low2float(x->ds);
+        const float d = r.dw * v.d8;
         return d * sumi;
     }
 };
@@ -1215,6 +1309,61 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     }
 }
 
+template<typename F, typename = void>
+struct has_split_x : std::false_type {};
+template<typename F>
+struct has_split_x<F, std::void_t<typename F::X>> : std::true_type {};
+
+// native_mmvq_multi_kernel for traits with load_x/dot: each column's activation values are loaded once per block
+// step and used for all ROWS rows (the plain kernel loads them again for every row).  Every row keeps its thread
+// mapping, its order of += and the cross-warp sum, so each output is bitwise the one-row kernel's.
+template<typename F, int NCOLS, int NW, int ROWS>
+__launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
+__global__ void native_mmvq_multi_xr_kernel(const typename F::Block* __restrict__ w,
+                                            const Q81Block* __restrict__ x,
+                                            float* __restrict__ y, int n_in, int n_out) {
+    constexpr int BPI = F::BPI * NW / WARPS;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    float tmp[NCOLS][ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+        typename F::X xv[NCOLS];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) xv[j] = F::load_x(x + std::size_t(j) * x_stride + kby, kqs);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::dot(wv, xv[j]);
+            }
+        }
+    }
+    __shared__ float partial[NW - 1 > 0 ? NW - 1 : 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
@@ -1226,6 +1375,15 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         return;
     }
     const dim3 threads(WARP, WARPS);
+    if constexpr (has_split_x<F>::value) {
+        // Rows per block, A/B in one process on a GTX 1070 (us, one-row kernel -> this): Q8_0 2560 -> 10240 at
+        // 2/3/4 columns 171/203/212 -> 154/166/170 with 4 rows; the Q6_K head 2560 -> 248320 4297/5197/6137 ->
+        // 4143/4669/5190 with 2 rows.  Four rows lost on every other format, and on Q8_0 beyond four columns.
+        constexpr int ROWS = std::is_same<typename F::Block, Q80Block>::value && NCOLS <= 4 ? 4 : 2;
+        const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
+        native_mmvq_multi_xr_kernel<F, NCOLS, WARPS, ROWS><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+        return;
+    }
     if (n_in / F::DIV < F::BPI) {
         constexpr int ROWS = 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
