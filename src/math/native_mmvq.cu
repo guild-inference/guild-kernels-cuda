@@ -1648,14 +1648,66 @@ bool g_staged_off = std::getenv("GUILD_MMVQ_STAGED") && std::string(std::getenv(
 // and 181 -> 193 GB/s; not Q8_0's sums, too short for it (202 -> 169 at three columns), nor Q4_K's, where the
 // compiler's choices made three columns 127 -> 133 in one build and -> 121 in the next.
 template<typename F> struct Staged { static constexpr int C = 0; }; // the other formats: not staged
-template<> struct Staged<Q4KTraits> { static constexpr int C = 8, MAX_COLS = 3, ROLL = 9; };   // 1152 bytes
-template<> struct Staged<Q6KTraits> { static constexpr int C = 8, MAX_COLS = 8, ROLL = 2; };   // 1680 bytes
-template<> struct Staged<SmallTraits<Q80Block, 8>> {                                            // 1088 bytes
-    static constexpr int C = 32, MAX_COLS = 4, ROLL = 9;
+//
+// XREC, put, get: the activations as the format's loads read them, written once per block when the columns are copied
+// in, so a lane takes its ints and its scale in one 8- or 16-byte load instead of three to six 4-byte ones.  The same
+// values (the scale is __low2float(ds), as load_x computes it), so get gives load_x's X bit for bit.  They take 1.8x
+// (Q6_K) or 2.7x (Q4_K) the shared memory of the Q8_1 blocks, so they are used while a block's shared memory stays
+// within 32 KiB (three blocks an SM before Volta): Q6_K 2048 -> 248320 at 2 / 3 / 4 columns 192 -> 208, 159 -> 176,
+// 126 -> 145 GB/s on a GTX 1070, but 2560 wide at 4 columns (34 KiB) 113 -> 105.  Not for Q8_0 (no gain measured).
+template<> struct Staged<Q4KTraits> {                                                           // 1152 bytes
+    static constexpr int C = 8, MAX_COLS = 3, ROLL = 9;
+    // slot s = kqs / 2 % 4 of a Q8_1 block: its ints s and s + 4 and the scale.  6 slots of 16 bytes a block, so
+    // the two blocks a quarter-warp reads (two apart) fall in different banks.
+    static constexpr int XREC = 96, XSLOTS = 4;
+    __device__ static void put(uint8_t* rec, const Q81Block* __restrict__ b, int s) {
+        const int* q = reinterpret_cast<const int*>(b->qs);
+        *reinterpret_cast<int4*>(rec + 16 * s) = make_int4(q[s], q[s + 4], __float_as_int(__low2float(b->ds)), 0);
+    }
+    __device__ static Q4KTraits::X get(const uint8_t* xs, int kbx, int iqs) {
+        const int bq8_offset = 2 * ((iqs / 2) / 4), sl = (iqs / 2) % 4;
+        Q4KTraits::X v;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int4 r = *reinterpret_cast<const int4*>(xs + (kbx * 8 + bq8_offset + i) * XREC + 16 * sl);
+            v.u[2 * i] = r.x;
+            v.u[2 * i + 1] = r.y;
+            v.d8[i] = __int_as_float(r.z);
+        }
+        return v;
+    }
 };
+template<> struct Staged<Q6KTraits> {                                                           // 1680 bytes
+    static constexpr int C = 8, MAX_COLS = 8, ROLL = 2;
+    // int q = 0..7 of a Q8_1 block with the scale
+    static constexpr int XREC = 64, XSLOTS = 8;
+    __device__ static void put(uint8_t* rec, const Q81Block* __restrict__ b, int s) {
+        *reinterpret_cast<int2*>(rec + 8 * s) =
+            make_int2(reinterpret_cast<const int*>(b->qs)[s], __float_as_int(__low2float(b->ds)));
+    }
+    __device__ static Q6KTraits::X get(const uint8_t* xs, int kbx, int iqs) {
+        const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+        Q6KTraits::X v;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int2 r = *reinterpret_cast<const int2*>(xs + (kbx * 8 + bq8_offset + 2 * i) * XREC + 8 * (iqs % 8));
+            v.u[i] = r.x;
+            v.d8[i] = __int_as_float(r.y);
+        }
+        return v;
+    }
+};
+template<> struct Staged<SmallTraits<Q80Block, 8>> {                                            // 1088 bytes
+    static constexpr int C = 32, MAX_COLS = 4, ROLL = 9, XREC = 0;
+};
+// the bytes of shared memory a column's activations take, as records (XR) or as Q8_1 blocks
+template<typename F, bool XR>
+__host__ __device__ constexpr int staged_xcol(int n_in) {
+    return XR ? (n_in / Q8K) * Staged<F>::XREC : (n_in / Q8K) * int(sizeof(Q81Block));
+}
 constexpr int STAGED_NW = 8; // warps a block
 
-template<typename F, int NCOLS>
+template<typename F, int NCOLS, bool XR>
 __launch_bounds__(STAGED_NW * WARP)
 __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x,
                                           float* __restrict__ y, int n_in, int n_out) {
@@ -1666,8 +1718,13 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
     static_assert(CB % 16 == 0 && C % F::BPI == 0 && F::BPI * F::T == WARPS * WARP && WARP % F::T == 0,
                   "a chunk must be whole 16-byte pieces and whole steps of the ncols = 1 kernel");
     extern __shared__ __align__(16) uint8_t smem[];
-    const int nb = n_in / F::DIV, xb = n_in / Q8K, xbytes = NCOLS * xb * int(sizeof(Q81Block));
-    {
+    const int nb = n_in / F::DIV, xb = n_in / Q8K, xcol = staged_xcol<F, XR>(n_in), xbytes = NCOLS * xcol;
+    if constexpr (XR) {
+        for (int i = int(threadIdx.x); i < NCOLS * xb * Staged<F>::XSLOTS; i += STAGED_NW * WARP) {
+            const int g = i / Staged<F>::XSLOTS; // column * xb + Q8_1 block
+            Staged<F>::put(smem + g * Staged<F>::XREC, x + g, i - g * Staged<F>::XSLOTS);
+        }
+    } else {
         const uint8_t* xg = reinterpret_cast<const uint8_t*>(x);
         const int n16 = reinterpret_cast<std::uintptr_t>(xg) % 16 == 0 ? xbytes / 16 : 0;
         for (int i = int(threadIdx.x); i < n16; i += STAGED_NW * WARP)
@@ -1738,7 +1795,12 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
                 if (kbx < nb) {
                     const typename F::W wv = F::load(reinterpret_cast<const Block*>(sb + b * BS), kqs);
 #pragma unroll
-                    for (int j = 0; j < NCOLS; ++j) acc[j][s] += F::apply(wv, xs + j * xb + kbx * F::KBY, kqs);
+                    for (int j = 0; j < NCOLS; ++j) {
+                        if constexpr (XR)
+                            acc[j][s] += F::dot(wv, Staged<F>::get(smem + j * xcol, kbx, kqs));
+                        else
+                            acc[j][s] += F::apply(wv, xs + j * xb + kbx * F::KBY, kqs);
+                    }
                 }
             }
         };
@@ -1784,7 +1846,7 @@ thread_local StagedDevice g_staged_dev;
 // As many blocks as the GPU holds at once, and every warp the same number of rows (a warp takes every
 // (blocks x 8)-th row): a warp's next row loads while it finishes the last, and a block copies the activations once
 // for all its rows.  The blocks a GPU holds depend on the shared memory, so they are kept per KiB of it.
-template<typename F, int NCOLS>
+template<typename F, int NCOLS, bool XR>
 void staged_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, std::size_t smem,
                      cudaStream_t s) {
     thread_local int dev_of = -1, resident[49] = {};
@@ -1795,25 +1857,30 @@ void staged_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in
     int& held = resident[(smem + 1023) / 1024];
     if (held == 0) {
         int per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, native_mmvq_staged_kernel<F, NCOLS>,
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, native_mmvq_staged_kernel<F, NCOLS, XR>,
                                                       STAGED_NW * WARP, (smem + 1023) / 1024 * 1024);
         held = per_sm > 0 ? g_staged_dev.sms * per_sm : 1;
     }
     const std::size_t per_pass = std::size_t(STAGED_NW) * held, rows = (std::size_t(n_out) + per_pass - 1) / per_pass;
     const unsigned blocks = unsigned((std::size_t(n_out) + STAGED_NW * rows - 1) / (STAGED_NW * rows));
-    native_mmvq_staged_kernel<F, NCOLS><<<blocks, STAGED_NW * WARP, smem, s>>>(
+    native_mmvq_staged_kernel<F, NCOLS, XR><<<blocks, STAGED_NW * WARP, smem, s>>>(
         static_cast<const uint8_t*>(weights), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
 }
 
-// staged_launch_n<F, ncols> for NCOLS <= ncols <= the format's MAX_COLS
+// staged_launch_n<F, ncols, xr> for NCOLS <= ncols <= the format's MAX_COLS
 template<typename F, int NCOLS>
-void staged_launch(int ncols, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
+void staged_launch(int ncols, bool xr, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
                    std::size_t smem, cudaStream_t s) {
     if constexpr (NCOLS <= Staged<F>::MAX_COLS) {
-        if (ncols == NCOLS)
-            staged_launch_n<F, NCOLS>(weights, x_q8_1, y, n_in, n_out, smem, s);
+        if (ncols != NCOLS)
+            staged_launch<F, NCOLS + 1>(ncols, xr, weights, x_q8_1, y, n_in, n_out, smem, s);
+        else if constexpr (Staged<F>::XREC > 0)
+            if (xr)
+                staged_launch_n<F, NCOLS, true>(weights, x_q8_1, y, n_in, n_out, smem, s);
+            else
+                staged_launch_n<F, NCOLS, false>(weights, x_q8_1, y, n_in, n_out, smem, s);
         else
-            staged_launch<F, NCOLS + 1>(ncols, weights, x_q8_1, y, n_in, n_out, smem, s);
+            staged_launch_n<F, NCOLS, false>(weights, x_q8_1, y, n_in, n_out, smem, s);
     }
 }
 
@@ -1828,8 +1895,13 @@ bool staged_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, in
             reinterpret_cast<std::uintptr_t>(weights) % 16 != 0)
             return false;
         constexpr int CB = Staged<F>::C * int(sizeof(typename F::Block));
-        const std::size_t xbytes = std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
-        const std::size_t smem = (xbytes + 15) / 16 * 16 + std::size_t(STAGED_NW) * (CB + 16);
+        auto smem_of = [&](bool xr) {
+            const std::size_t xbytes = std::size_t(ncols) * std::size_t(xr ? staged_xcol<F, true>(n_in)
+                                                                            : staged_xcol<F, false>(n_in));
+            return (xbytes + 15) / 16 * 16 + std::size_t(STAGED_NW) * (CB + 16);
+        };
+        const bool xr = Staged<F>::XREC > 0 && smem_of(true) <= 32 * 1024;
+        const std::size_t smem = smem_of(xr);
         if (smem > 48 * 1024) return false; // every column's activations beside the rows, without an opt-in
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess) return false;
@@ -1843,7 +1915,7 @@ bool staged_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, in
         if (std::size_t(n_out) * (n_in / F::DIV) * sizeof(typename F::Block) <
             std::size_t(g_staged_dev.sms) * 100 * 1024)
             return false;
-        staged_launch<F, 1>(ncols, weights, x_q8_1, y, n_in, n_out, smem, static_cast<cudaStream_t>(stream));
+        staged_launch<F, 1>(ncols, xr, weights, x_q8_1, y, n_in, n_out, smem, static_cast<cudaStream_t>(stream));
         return true;
     }
 }
