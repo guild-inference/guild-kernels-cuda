@@ -330,22 +330,23 @@ __global__ void router_top10_fast_kernel(const float* __restrict__ logits, int n
     for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
     if (lane == 0) s_dred[warp] = part;
     __syncthreads();
-    double tot = 0.0;
-    for (int w = 0; w < nw; ++w) tot += s_dred[w];
-    const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
-    const float f_lo = (float) (1.0 / hi), f_hi = (float) (1.0 / lo);
-    float inv;
-    if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
-        inv = f_lo;
-    } else {   // block-uniform (every thread computed the same tot): the serial sum, exactly as router_top10_kernel
-        if (tid == 0) {
+    // the bracket on thread 0 alone: in every thread (the same tot everywhere) the 2 x 256 double divisions queued
+    // on the GTX 1070's few FP64 units ahead of wave 0's own, ~2.6 us of a ~9 us call
+    if (tid == 0) {
+        double tot = 0.0;
+        for (int w = 0; w < nw; ++w) tot += s_dred[w];
+        const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
+        const float f_lo = (float) (1.0 / hi), f_hi = (float) (1.0 / lo);
+        if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
+            s_inv = f_lo;
+        } else {   // the serial sum, exactly as router_top10_kernel
             double sum = 0.0;
             for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
             s_inv = (float) (1.0 / sum);
         }
-        __syncthreads();
-        inv = s_inv;
     }
+    __syncthreads();
+    const float inv = s_inv;
     if (warp != 0) return;
     // wave 0: lane holds experts lane + 32 j; p is router_top10_kernel's expression
     constexpr int PER = 16;
