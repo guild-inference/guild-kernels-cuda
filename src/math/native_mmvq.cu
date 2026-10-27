@@ -1627,6 +1627,231 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
     }
 }
 
+// ---- Staged rows (CUDA): a warp a row, read through shared memory with 16-byte loads ----
+//
+// The kernels above read a row with each format's own loads: Q6_K's and Q8_0's blocks (210 and 34 bytes) are only
+// 2-byte aligned, so each int of weights is two 2-byte loads, and Q4_K's ints are 4-byte loads.  On a GTX 1070 that
+// is 155-198 GB/s at one column, of the card's ~220, and less with more columns.  Here a warp owns a row at a time:
+// it copies C blocks of it into shared memory with aligned 16-byte loads, the next C blocks (of this row or of its
+// next one) arriving in registers while it computes on the last, and the block's warps read the activations of
+// every column from shared memory.  Lane l stands for the threads l, 32 + l, 64 + l and 96 + l of the ncols = 1
+// kernel: the same blocks in the same order into four sums, added ((0 + 1) + 2) + 3 and then across the lanes by
+// warp_sum, so each output is bitwise the ncols = 1 kernel's, at every column count.  GUILD_MMVQ_STAGED=0 turns it
+// off; tools: Guild's mmvq_staged_parity (bitwise) and `glm5_kernels_test shapes` (GB/s).
+#if !defined(GUILD_USE_HIP)
+bool g_staged_off = std::getenv("GUILD_MMVQ_STAGED") && std::string(std::getenv("GUILD_MMVQ_STAGED")) == "0";
+
+// C: blocks a warp stages at a time.  MAX_COLS: the most columns that are faster than launch_multi's kernels on a
+// GTX 1070 (Q8_0 2560 -> 10240: 161 against 151 GB/s at 5 columns but 147 against 161 for 6144 -> 2560; Q4_K at 4
+// columns: 89-102 against 97-108).  ROLL: from this many columns the four sums are taken one after the other in a
+// loop (rotating the accumulators) instead of unrolled, for fewer registers: Q6_K's heads at two columns 160 -> 163
+// and 181 -> 193 GB/s; not Q8_0's sums, too short for it (202 -> 169 at three columns), nor Q4_K's, where the
+// compiler's choices made three columns 127 -> 133 in one build and -> 121 in the next.
+template<typename F> struct Staged { static constexpr int C = 0; }; // the other formats: not staged
+template<> struct Staged<Q4KTraits> { static constexpr int C = 8, MAX_COLS = 3, ROLL = 9; };   // 1152 bytes
+template<> struct Staged<Q6KTraits> { static constexpr int C = 8, MAX_COLS = 8, ROLL = 2; };   // 1680 bytes
+template<> struct Staged<SmallTraits<Q80Block, 8>> {                                            // 1088 bytes
+    static constexpr int C = 32, MAX_COLS = 4, ROLL = 9;
+};
+constexpr int STAGED_NW = 8; // warps a block
+
+template<typename F, int NCOLS>
+__launch_bounds__(STAGED_NW * WARP)
+__global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x,
+                                          float* __restrict__ y, int n_in, int n_out) {
+    using Block = typename F::Block;
+    constexpr int BS = int(sizeof(Block)), C = Staged<F>::C, CB = C * BS;
+    // 16-byte pieces a lane carries: a chunk's, and one more where the row starts inside a piece
+    constexpr int KV = (CB / 16 + 1 + WARP - 1) / WARP;
+    static_assert(CB % 16 == 0 && C % F::BPI == 0 && F::BPI * F::T == WARPS * WARP && WARP % F::T == 0,
+                  "a chunk must be whole 16-byte pieces and whole steps of the ncols = 1 kernel");
+    extern __shared__ __align__(16) uint8_t smem[];
+    const int nb = n_in / F::DIV, xb = n_in / Q8K, xbytes = NCOLS * xb * int(sizeof(Q81Block));
+    {
+        const uint8_t* xg = reinterpret_cast<const uint8_t*>(x);
+        const int n16 = reinterpret_cast<std::uintptr_t>(xg) % 16 == 0 ? xbytes / 16 : 0;
+        for (int i = int(threadIdx.x); i < n16; i += STAGED_NW * WARP)
+            reinterpret_cast<int4*>(smem)[i] = __ldg(reinterpret_cast<const int4*>(xg) + i);
+        for (int o = 16 * n16 + 4 * int(threadIdx.x); o < xbytes; o += 4 * STAGED_NW * WARP)
+            *reinterpret_cast<int*>(smem + o) = __ldg(reinterpret_cast<const int*>(xg + o));
+    }
+    __syncthreads();
+    const int warp = int(threadIdx.x) / WARP, lane = int(threadIdx.x) % WARP;
+    int r = int(blockIdx.x) * STAGED_NW + warp; // this warp's rows: r, r + rstep, ...
+    if (r >= n_out) return;
+    const Q81Block* xs = reinterpret_cast<const Q81Block*>(smem);
+    uint8_t* sm = smem + (xbytes + 15) / 16 * 16 + warp * (CB + 16);
+    const std::size_t rb = std::size_t(nb) * BS;
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(w), end = base + std::size_t(n_out) * rb;
+    const int nchunk = (nb + C - 1) / C, rstep = int(gridDim.x) * STAGED_NW;
+    // the aligned pieces under chunk c of row rr: the host checked that w is 16-byte aligned, so only the matrix's
+    // last piece can run past its end, and that one is read in 2-byte parts
+    auto pieces = [&](int rr, int c, std::uintptr_t& a0) {
+        const std::uintptr_t g0 = base + std::size_t(rr) * rb + std::size_t(c) * CB;
+        a0 = g0 & ~std::uintptr_t(15);
+        return int((g0 + min(std::size_t(CB), rb - std::size_t(c) * CB) - a0 + 15) / 16);
+    };
+    int4 pf[KV];
+    auto fetch = [&](int rr, int c) {
+        std::uintptr_t a0;
+        const int n = pieces(rr, c, a0);
+#pragma unroll
+        for (int k = 0; k < KV; ++k) {
+            const int p = lane + WARP * k;
+            if (p >= n) break;
+            const std::uintptr_t a = a0 + 16 * std::uintptr_t(p);
+            if (a + 16 <= end) {
+                pf[k] = __ldg(reinterpret_cast<const int4*>(a));
+            } else {
+                uint32_t v[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    if (a + 2 * j < end)
+                        v[j / 2] |= uint32_t(__ldg(reinterpret_cast<const uint16_t*>(a) + j)) << (16 * (j % 2));
+                pf[k] = make_int4(int(v[0]), int(v[1]), int(v[2]), int(v[3]));
+            }
+        }
+    };
+    float acc[NCOLS][WARPS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+        for (int t = 0; t < WARPS; ++t) acc[j][t] = 0.0f;
+    fetch(r, 0);
+    for (int c = 0;;) {
+        std::uintptr_t a0;
+        const int n = pieces(r, c, a0);
+        __syncwarp();
+#pragma unroll
+        for (int k = 0; k < KV; ++k)
+            if (lane + WARP * k < n) reinterpret_cast<int4*>(sm)[lane + WARP * k] = pf[k];
+        __syncwarp();
+        const int nr = c + 1 < nchunk ? r : r + rstep, nc = c + 1 < nchunk ? c + 1 : 0;
+        if (nr < n_out) fetch(nr, nc);
+        const uint8_t* sb = sm + int((base + std::size_t(r) * rb) & 15);
+        // the ncols = 1 kernel's thread WARP * t + lane: its blocks of this chunk into sum t
+        auto step = [&](int t, int s) {
+            const int tid = WARP * t + lane, kqs = F::kqs(tid);
+#pragma unroll
+            for (int i = 0; i < C / F::BPI; ++i) {
+                const int b = tid / F::T + i * F::BPI, kbx = c * C + b;
+                if (kbx < nb) {
+                    const typename F::W wv = F::load(reinterpret_cast<const Block*>(sb + b * BS), kqs);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) acc[j][s] += F::apply(wv, xs + j * xb + kbx * F::KBY, kqs);
+                }
+            }
+        };
+        if constexpr (NCOLS >= Staged<F>::ROLL) {
+#pragma unroll 1
+            for (int t = 0; t < WARPS; ++t) {
+                step(t, 0);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) { // sum t + 1 to the front; after all four, each back in place
+                    const float a = acc[j][0];
+#pragma unroll
+                    for (int u = 0; u + 1 < WARPS; ++u) acc[j][u] = acc[j][u + 1];
+                    acc[j][WARPS - 1] = a;
+                }
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < WARPS; ++t) step(t, t);
+        }
+        if (c + 1 == nchunk) {
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                float v = acc[j][0];
+#pragma unroll
+                for (int t = 1; t < WARPS; ++t) v += acc[j][t];
+                v = warp_sum(v);
+                if (lane == 0) y[std::size_t(j) * n_out + r] = v;
+#pragma unroll
+                for (int t = 0; t < WARPS; ++t) acc[j][t] = 0.0f;
+            }
+        }
+        if (nr >= n_out) break;
+        r = nr;
+        c = nc;
+    }
+}
+
+struct StagedDevice {
+    int dev = -1, sms = 0;
+};
+thread_local StagedDevice g_staged_dev;
+
+// As many blocks as the GPU holds at once, and every warp the same number of rows (a warp takes every
+// (blocks x 8)-th row): a warp's next row loads while it finishes the last, and a block copies the activations once
+// for all its rows.  The blocks a GPU holds depend on the shared memory, so they are kept per KiB of it.
+template<typename F, int NCOLS>
+void staged_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, std::size_t smem,
+                     cudaStream_t s) {
+    thread_local int dev_of = -1, resident[49] = {};
+    if (g_staged_dev.dev != dev_of) {
+        dev_of = g_staged_dev.dev;
+        for (int& b : resident) b = 0;
+    }
+    int& held = resident[(smem + 1023) / 1024];
+    if (held == 0) {
+        int per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, native_mmvq_staged_kernel<F, NCOLS>,
+                                                      STAGED_NW * WARP, (smem + 1023) / 1024 * 1024);
+        held = per_sm > 0 ? g_staged_dev.sms * per_sm : 1;
+    }
+    const std::size_t per_pass = std::size_t(STAGED_NW) * held, rows = (std::size_t(n_out) + per_pass - 1) / per_pass;
+    const unsigned blocks = unsigned((std::size_t(n_out) + STAGED_NW * rows - 1) / (STAGED_NW * rows));
+    native_mmvq_staged_kernel<F, NCOLS><<<blocks, STAGED_NW * WARP, smem, s>>>(
+        static_cast<const uint8_t*>(weights), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
+}
+
+// staged_launch_n<F, ncols> for NCOLS <= ncols <= the format's MAX_COLS
+template<typename F, int NCOLS>
+void staged_launch(int ncols, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
+                   std::size_t smem, cudaStream_t s) {
+    if constexpr (NCOLS <= Staged<F>::MAX_COLS) {
+        if (ncols == NCOLS)
+            staged_launch_n<F, NCOLS>(weights, x_q8_1, y, n_in, n_out, smem, s);
+        else
+            staged_launch<F, NCOLS + 1>(ncols, weights, x_q8_1, y, n_in, n_out, smem, s);
+    }
+}
+
+// false: the caller takes its usual path
+template<typename F>
+bool staged_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if constexpr (Staged<F>::C == 0) {
+        return false;
+    } else {
+        // the upstream multi-column layout asked for, or a row base not 16-byte aligned
+        if (g_staged_off || ncols > Staged<F>::MAX_COLS || (ncols > 1 && !g_multi_exact) ||
+            reinterpret_cast<std::uintptr_t>(weights) % 16 != 0)
+            return false;
+        constexpr int CB = Staged<F>::C * int(sizeof(typename F::Block));
+        const std::size_t xbytes = std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
+        const std::size_t smem = (xbytes + 15) / 16 * 16 + std::size_t(STAGED_NW) * (CB + 16);
+        if (smem > 48 * 1024) return false; // every column's activations beside the rows, without an opt-in
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        if (dev != g_staged_dev.dev) {
+            g_staged_dev.dev = dev;
+            if (cudaDeviceGetAttribute(&g_staged_dev.sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+                g_staged_dev.sms = 0;
+        }
+        // too little to keep the GPU's warps busy with a row each (GTX 1070, 15 SMs: Q8_0 2560 -> 512, 1.4 MB, 135
+        // against 147 GB/s; 2560 -> 640, 1.7 MB, 153 against 154; Q4_K 2048 -> 512 96 against 108)
+        if (std::size_t(n_out) * (n_in / F::DIV) * sizeof(typename F::Block) <
+            std::size_t(g_staged_dev.sms) * 100 * 1024)
+            return false;
+        staged_launch<F, 1>(ncols, weights, x_q8_1, y, n_in, n_out, smem, static_cast<cudaStream_t>(stream));
+        return true;
+    }
+}
+#else
+template<typename F>
+bool staged_mmvq(const void*, const void*, float*, int, int, int, void*) { return false; }
+#endif
+
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
@@ -1729,6 +1954,10 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     GUILD_WAVE_MMVQ(SmallTraits<Weight, Qi>)
+    if (staged_mmvq<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+        launch_check();
+        return;
+    }
     if (ncols > 1) {
         launch_multi<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -1970,6 +2199,10 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     GUILD_WAVE_MMVQ(Q4KTraits)
+    if (staged_mmvq<Q4KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+        launch_check();
+        return;
+    }
     if (ncols > 1) {
         launch_multi<Q4KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -2010,6 +2243,10 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     GUILD_WAVE_MMVQ(Q6KTraits)
+    if (staged_mmvq<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+        launch_check();
+        return;
+    }
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
