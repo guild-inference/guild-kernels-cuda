@@ -765,6 +765,204 @@ __global__ void __launch_bounds__(THREADS) gr_up_planes_kernel(GrMulti m) {
     }
 }
 
+#if !defined(__HIPCC__)
+// ---- One or two tokens before sm_70 (a verify group): the down and up products without tiles.  The staged down
+// kernel above waits on its activation tile every 512 floats (two barriers a tile, so its weight loads are in flight
+// one tile at a time: 45 us for the 6.6 MB matrix on a GTX 1070, 147 GB/s), and the two-plane up kernel spends
+// longer in its arithmetic than in its loads (five shuffles a row and token, the tail chunk on 8 lanes of 32: 37 us
+// of arithmetic against 32 us of loads at two tokens).  GUILD_HC_DIRECT=0: the staged pair as before.
+
+// gr_down_direct: a warp takes two rows (the 320 down rows, then the 4 inject rows) in the plain read's lane order -
+// lane l sums chunks l, l+32, ... in that order, then the same xor tree - with the weights streaming through a 4-deep
+// register ring and each chunk's activations read from L1 one chunk ahead.  No shared memory and no barrier.
+constexpr int DD_ROWS = 2, DD_RING = 4, DD_WARPS = 4;
+constexpr int DD_BLOCKS = (LR + HC + DD_ROWS * DD_WARPS - 1) / (DD_ROWS * DD_WARPS);   // 41
+template <int T>
+__global__ void __launch_bounds__(DD_WARPS * 32) gr_down_direct_kernel(GrMulti m) {
+    constexpr int Q = D / 8 / 32;   // 40 chunks a lane
+    const int lane = threadIdx.x & 31, warp = blockIdx.x * DD_WARPS + (threadIdx.x >> 5);
+    const int nrows = LR + (m.a[0].w_inject != nullptr ? HC : 0);
+    const int g0 = warp * DD_ROWS;
+    if (g0 >= nrows) return;
+    const uint4* w4[DD_ROWS];
+#pragma unroll
+    for (int r = 0; r < DD_ROWS; ++r) {
+        const int g = g0 + r < nrows ? g0 + r : nrows - 1;
+        w4[r] = reinterpret_cast<const uint4*>(g < LR ? m.a[0].w_down + (size_t) g * D
+                                                      : m.a[0].w_inject + (size_t) (g - LR) * D) + lane;
+    }
+    const float4* x4 = reinterpret_cast<const float4*>(m.xn) + 2 * lane;
+    uint4 ring[DD_RING][DD_ROWS];
+#pragma unroll
+    for (int p = 0; p < DD_RING; ++p)
+#pragma unroll
+        for (int r = 0; r < DD_ROWS; ++r) ring[p][r] = __ldg(w4[r] + 32 * p);
+    float4 xa[T], xb[T];
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        xa[k] = __ldg(x4 + (size_t) k * (D / 4));
+        xb[k] = __ldg(x4 + (size_t) k * (D / 4) + 1);
+    }
+    float acc[DD_ROWS][T];
+#pragma unroll
+    for (int r = 0; r < DD_ROWS; ++r)
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[r][k] = 0.0f;
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        uint4 w[DD_ROWS];
+#pragma unroll
+        for (int r = 0; r < DD_ROWS; ++r) w[r] = ring[q % DD_RING][r];
+        if (q + DD_RING < Q) {
+#pragma unroll
+            for (int r = 0; r < DD_ROWS; ++r) ring[q % DD_RING][r] = __ldg(w4[r] + 32 * (q + DD_RING));
+        }
+        float4 na[T], nb[T];
+        if (q + 1 < Q) {
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                na[k] = __ldg(x4 + (size_t) k * (D / 4) + 64 * (q + 1));
+                nb[k] = __ldg(x4 + (size_t) k * (D / 4) + 64 * (q + 1) + 1);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < DD_ROWS; ++r)
+#pragma unroll
+            for (int k = 0; k < T; ++k) acc[r][k] += dot8v(w[r], xa[k], xb[k]);
+        if (q + 1 < Q) {
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                xa[k] = na[k];
+                xb[k] = nb[k];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < DD_ROWS; ++r) {
+        const int g = g0 + r;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float s = warp_sum(acc[r][k]);
+            if (lane != k || g >= nrows) continue;
+            if (g >= LR) {
+                m.a[k].inject_out[g - LR] = s;
+            } else {
+                const float x = s / (float) HC;
+                m.a[k].lo[g] = x / (1.0f + __expf(-x));
+            }
+        }
+    }
+}
+
+// gr_up_cols: a warp takes whole columns d, grid-stride over a grid that fills the card once.  Its four groups of 8
+// lanes are the four streams c (row c*N + d), and lane j of a group holds the plain read's lanes j, j+8, j+16, j+24
+// and chunk 32+j, so the xor tree's stages 16 and 8 are its own adds ((p0 + p2) + (p1 + p3), as gr_up_fast_kernel
+// does on AMD), stages 4, 2, 1 three shuffles, and the mixed sum over the streams three more: no shared g and no
+// barrier after the one that stages lo (two planes, as gr_up_planes_kernel).  The next column's weights and epilogue
+// inputs load while this one computes.
+template <int T>
+__global__ void __launch_bounds__(THREADS) gr_up_cols_kernel(GrMulti m) {
+    __shared__ __align__(16) float4 lo4[T][2][LR / 8];
+    const int t = threadIdx.x, lane = t & 31, j = lane & 7, c = lane >> 3;
+    const int gw = blockIdx.x * WARPS + (t >> 5), nw = gridDim.x * WARPS;
+    const bool apply = j < T && m.a[j < T ? j : 0].apply;   // token j's pending write, on the lanes j < T
+    const float gwc = apply ? 2.0f * sigmoidf_(m.a[j].inj_prev[c] / (float) HC) : 0.0f;
+    const float rsc = j < T ? m.a[j].rs[c] : 0.0f;
+    uint4 w[5];
+    float rv = 0.0f, wn = 0.0f, bo = 0.0f;
+    auto load = [&](int d, uint4(&wd)[5], float& r_, float& n_, float& b_) {
+        const int i = c * N + d;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) wd[q] = __ldg(w4 + j + 8 * q);
+        wd[4] = __ldg(w4 + 32 + j);
+        if (j < T) {
+            const FusedGrArgs& a = m.a[j];
+            r_ = a.R[i];
+            n_ = a.w_norm[i];
+            if (apply) b_ = a.bo_prev[d];
+        }
+    };
+    int d = gw;
+    if (d < N) load(d, w, rv, wn, bo);
+    for (int e = t; e < T * LR; e += THREADS) {
+        const int k = e / LR, f = e - k * LR;
+        reinterpret_cast<float*>(&lo4[k][(f & 7) >> 2][f >> 3])[f & 3] = m.a[k].lo[f];
+    }
+    __syncthreads();
+    for (; d < N; d += nw) {
+        uint4 wn_next[5];
+        float rv_next = 0.0f, wnorm_next = 0.0f, bo_next = 0.0f;
+        if (d + nw < N) load(d + nw, wn_next, rv_next, wnorm_next, bo_next);
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float p0 = dot8v(w[0], lo4[k][0][j], lo4[k][1][j]) + dot8v(w[4], lo4[k][0][32 + j], lo4[k][1][32 + j]);
+            const float p1 = dot8v(w[1], lo4[k][0][j + 8], lo4[k][1][j + 8]);
+            const float p2 = dot8v(w[2], lo4[k][0][j + 16], lo4[k][1][j + 16]);
+            const float p3 = dot8v(w[3], lo4[k][0][j + 24], lo4[k][1][j + 24]);
+            float s = (p0 + p2) + (p1 + p3);
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            if (j == k) mine = s;
+        }
+        float gv = 0.0f;   // lane (c, j < T): token j's g of stream c
+        if (j < T) {
+            float x0 = rv;
+            if (apply) {
+                x0 = fmaf(bo, gwc, x0);
+                m.a[j].R_out[c * N + d] = x0;
+            }
+            const float x = x0 * wn * rsc;
+            gv = x * sigmoidf_(mine);
+        }
+        const float g1 = __shfl_sync(0xffffffffu, gv, j + 8), g2 = __shfl_sync(0xffffffffu, gv, j + 16),
+                    g3 = __shfl_sync(0xffffffffu, gv, j + 24);
+        if (c == 0 && j < T) {
+            float s = 0.0f;
+            s += gv;
+            s += g1;
+            s += g2;
+            s += g3;
+            m.a[j].mixed[d] = s / (float) HC;
+        }
+#pragma unroll
+        for (int q = 0; q < 5; ++q) w[q] = wn_next[q];
+        rv = rv_next;
+        wn = wnorm_next;
+        bo = bo_next;
+    }
+}
+
+bool hc_direct() {
+    static const bool on = [] {
+        const char* v = std::getenv("GUILD_HC_DIRECT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// gr_up_cols_kernel<T>'s grid on the current card: as many blocks as fit at once (cached per device)
+int up_cols_blocks(int T) {
+    static int blocks[64][2] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return 30;
+    }
+    int& b = blocks[dev][T - 1];
+    if (b == 0) {
+        int sms = 0, per_sm = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (T == 1) cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gr_up_cols_kernel<1>, THREADS, 0);
+        else cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gr_up_cols_kernel<2>, THREADS, 0);
+        cudaGetLastError();
+        b = (sms > 0 ? sms : 15) * (per_sm > 0 ? per_sm : 1);
+    }
+    return b;
+}
+#endif
+
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
 // stages n_tok * TILEV floats (1280 on sm_75, 2560 elsewhere), staged two tiles of n_tok * H_TILE.  The shared-memory
 // opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
@@ -875,6 +1073,16 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     int tv = 2560, st_tile = H_TILE;
     const int chunk_tok = down_chunk(staged, &tv, &st_tile);
     const bool p_tile = staged && st_tile == P_TILE;
+#if !defined(__HIPCC__)
+    if (p_tile && n_tok <= 2 && hc_direct()) {   // one or two tokens before sm_70: the direct down, the column up
+        if (n_tok == 1) gr_down_direct_kernel<1><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+        else gr_down_direct_kernel<2><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+        if (n_tok == 1) gr_up_cols_kernel<1><<<up_cols_blocks(1), THREADS, 0, st>>>(m);
+        else gr_up_cols_kernel<2><<<up_cols_blocks(2), THREADS, 0, st>>>(m);
+        return;
+    }
+#endif
     const size_t per_tok = (staged ? (size_t) 2 * st_tile : (size_t) tv) * sizeof(float);
     for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
         const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
@@ -1467,8 +1675,17 @@ void fused_gr_check() {
         "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)"};
     int tv = 0, st_tile = H_TILE;
     down_chunk(true, &tv, &st_tile);
-    std::fprintf(stderr, "guild hc: CUDA%d: the hyper-connection read runs as %s%s%s\n", dev, what[use],
+#if !defined(__HIPCC__)
+    const bool direct = hc_direct();
+#else
+    const bool direct = false;
+#endif
+    std::fprintf(stderr, "guild hc: CUDA%d: the hyper-connection read runs as %s%s%s%s\n", dev, what[use],
                  use == kHcStaged && st_tile == P_TILE ? " in 512-float tiles, with the two-plane up kernel" : "",
+                 use == kHcStaged && st_tile == P_TILE && direct
+                     ? " (one or two tokens: the direct down and the column up kernels, GUILD_HC_DIRECT=0 for the "
+                       "tiles)"
+                     : "",
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (GUILD_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");
 }
