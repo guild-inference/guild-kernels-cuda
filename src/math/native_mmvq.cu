@@ -1654,7 +1654,8 @@ template<typename F> struct Staged { static constexpr int C = 0; }; // the other
 // values (the scale is __low2float(ds), as load_x computes it), so get gives load_x's X bit for bit.  They take 1.8x
 // (Q6_K) or 2.7x (Q4_K) the shared memory of the Q8_1 blocks, so they are used while a block's shared memory stays
 // within 32 KiB (three blocks an SM before Volta): Q6_K 2048 -> 248320 at 2 / 3 / 4 columns 192 -> 208, 159 -> 176,
-// 126 -> 145 GB/s on a GTX 1070, but 2560 wide at 4 columns (34 KiB) 113 -> 105.  Not for Q8_0 (no gain measured).
+// 126 -> 145 GB/s on a GTX 1070, but 2560 wide at 4 columns (34 KiB) 113 -> 105.  Not for one column (the same speed)
+// nor for Q8_0 (no gain measured).
 template<> struct Staged<Q4KTraits> {                                                           // 1152 bytes
     static constexpr int C = 8, MAX_COLS = 3, ROLL = 9;
     // slot s = kqs / 2 % 4 of a Q8_1 block: its ints s and s + 4 and the scale.  6 slots of 16 bytes a block, so
@@ -1874,7 +1875,7 @@ void staged_launch(int ncols, bool xr, const void* weights, const void* x_q8_1, 
     if constexpr (NCOLS <= Staged<F>::MAX_COLS) {
         if (ncols != NCOLS)
             staged_launch<F, NCOLS + 1>(ncols, xr, weights, x_q8_1, y, n_in, n_out, smem, s);
-        else if constexpr (Staged<F>::XREC > 0)
+        else if constexpr (Staged<F>::XREC > 0 && NCOLS > 1)
             if (xr)
                 staged_launch_n<F, NCOLS, true>(weights, x_q8_1, y, n_in, n_out, smem, s);
             else
@@ -1900,7 +1901,8 @@ bool staged_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, in
                                                                             : staged_xcol<F, false>(n_in));
             return (xbytes + 15) / 16 * 16 + std::size_t(STAGED_NW) * (CB + 16);
         };
-        const bool xr = Staged<F>::XREC > 0 && smem_of(true) <= 32 * 1024;
+        // one column: the Q8_1 blocks (the records measured the same there, so no second kernel)
+        const bool xr = Staged<F>::XREC > 0 && ncols > 1 && smem_of(true) <= 32 * 1024;
         const std::size_t smem = smem_of(xr);
         if (smem > 48 * 1024) return false; // every column's activations beside the rows, without an opt-in
         int dev = 0;
