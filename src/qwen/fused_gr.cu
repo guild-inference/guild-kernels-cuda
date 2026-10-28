@@ -774,12 +774,16 @@ __global__ void __launch_bounds__(THREADS) gr_up_planes_kernel(GrMulti m) {
 
 // gr_down_direct: a warp takes two rows (the 320 down rows, then the 4 inject rows) in the plain read's lane order -
 // lane l sums chunks l, l+32, ... in that order, then the same xor tree - with the weights streaming through a 4-deep
-// register ring and each chunk's activations read from L1 one chunk ahead.  No shared memory and no barrier.
+// register ring and each chunk's activations read from L1 one chunk ahead.  No shared memory and no barrier.  The 40
+// chunks run as rounds of the 4-slot ring with the last round peeled, not fully unrolled: straight-line code for all
+// 40 (2800 instructions) ran 35 us after itself but 40-45 us after a kernel with code of its own (its instructions
+// fetched again), in the engine every time; this third of the code runs 35 us either way.
 constexpr int DD_ROWS = 2, DD_RING = 4, DD_WARPS = 4;
 constexpr int DD_BLOCKS = (LR + HC + DD_ROWS * DD_WARPS - 1) / (DD_ROWS * DD_WARPS);   // 41
 template <int T>
 __global__ void __launch_bounds__(DD_WARPS * 32) gr_down_direct_kernel(GrMulti m) {
     constexpr int Q = D / 8 / 32;   // 40 chunks a lane
+    static_assert(Q % DD_RING == 0, "whole rounds of the ring");
     const int lane = threadIdx.x & 31, warp = blockIdx.x * DD_WARPS + (threadIdx.x >> 5);
     const int nrows = LR + (m.a[0].w_inject != nullptr ? HC : 0);
     const int g0 = warp * DD_ROWS;
@@ -808,17 +812,17 @@ __global__ void __launch_bounds__(DD_WARPS * 32) gr_down_direct_kernel(GrMulti m
     for (int r = 0; r < DD_ROWS; ++r)
 #pragma unroll
         for (int k = 0; k < T; ++k) acc[r][k] = 0.0f;
-#pragma unroll
-    for (int q = 0; q < Q; ++q) {
+    // chunk q from ring slot p; refill the slot with chunk q + 4 (pf_w) and read chunk q + 1's activations (pf_x)
+    auto step = [&](int q, int p, bool pf_w, bool pf_x) {
         uint4 w[DD_ROWS];
 #pragma unroll
-        for (int r = 0; r < DD_ROWS; ++r) w[r] = ring[q % DD_RING][r];
-        if (q + DD_RING < Q) {
+        for (int r = 0; r < DD_ROWS; ++r) w[r] = ring[p][r];
+        if (pf_w) {
 #pragma unroll
-            for (int r = 0; r < DD_ROWS; ++r) ring[q % DD_RING][r] = __ldg(w4[r] + 32 * (q + DD_RING));
+            for (int r = 0; r < DD_ROWS; ++r) ring[p][r] = __ldg(w4[r] + 32 * (q + DD_RING));
         }
         float4 na[T], nb[T];
-        if (q + 1 < Q) {
+        if (pf_x) {
 #pragma unroll
             for (int k = 0; k < T; ++k) {
                 na[k] = __ldg(x4 + (size_t) k * (D / 4) + 64 * (q + 1));
@@ -829,14 +833,21 @@ __global__ void __launch_bounds__(DD_WARPS * 32) gr_down_direct_kernel(GrMulti m
         for (int r = 0; r < DD_ROWS; ++r)
 #pragma unroll
             for (int k = 0; k < T; ++k) acc[r][k] += dot8v(w[r], xa[k], xb[k]);
-        if (q + 1 < Q) {
+        if (pf_x) {
 #pragma unroll
             for (int k = 0; k < T; ++k) {
                 xa[k] = na[k];
                 xb[k] = nb[k];
             }
         }
+    };
+#pragma unroll 1
+    for (int q0 = 0; q0 < Q - DD_RING; q0 += DD_RING) {
+#pragma unroll
+        for (int p = 0; p < DD_RING; ++p) step(q0 + p, p, true, true);
     }
+#pragma unroll
+    for (int p = 0; p < DD_RING; ++p) step(Q - DD_RING + p, p, false, p + 1 < DD_RING);
 #pragma unroll
     for (int r = 0; r < DD_ROWS; ++r) {
         const int g = g0 + r;
