@@ -85,6 +85,9 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
         if (__isnanf(values[i])) values[i] = -FLT_MAX;
     }
     float selected = 0.0f, selected_sum = 0.0f;
+    // the ranks as a loop, not ten copies (1518 -> 408 instructions; one warp runs them once a token, so a copy of
+    // the code per rank was fetched once and never reused)
+#pragma unroll 1
     for (int rank = 0; rank < 10; ++rank) {
         float best = values[0];
         int expert = lane;
