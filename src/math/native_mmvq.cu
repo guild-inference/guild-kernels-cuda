@@ -1656,8 +1656,19 @@ template<typename F> struct Staged { static constexpr int C = 0; }; // the other
 // within 32 KiB (three blocks an SM before Volta): Q6_K 2048 -> 248320 at 2 / 3 / 4 columns 192 -> 208, 159 -> 176,
 // 126 -> 145 GB/s on a GTX 1070, but 2560 wide at 4 columns (34 KiB) 113 -> 105.  Not for one column (the same speed)
 // nor for Q8_0 (no gain measured).
+//
+// ROWC: rows of more than C and at most ROWC blocks are staged whole, one chunk a row, by kernels of their own (ONE in
+// native_mmvq_staged_kernel), instead of as a chunk of C blocks and a short one (a 2560-wide Q6_K row is 10 blocks: 8
+// and 2).  Those kernels also add each of the four sums, whole, to a running total instead of keeping four rotated
+// accumulators, carry a row's address on to the warp's next row, take Q6_K's scale product in 16 bits (Staged::dot),
+// read the records whenever they fit a block's 48 KiB (their registers hold an SM to two blocks from two columns
+// on, so the records cost no blocks), and are built with __launch_bounds__(256, 1), whose register choices measured
+// fastest.  Q6_K 2560 -> 248320 on a GTX 1070, us at 1 to 8 columns: 2505 3224 3631 4780 4961 6141 7372 7627 before,
+// 2429 2439 2707 3049 3477 3923 5451 6069 after (without the 1-block bound: 2438 2493 2888 3457 4401 5530 5708 6565);
+// 2304 and 3072 wide (9 and 12 blocks) at 4 columns 1064 -> 737 and 1451 -> 921 us.
+// GUILD_MMVQ_ROW_CHUNK=0 turns them off.
 template<> struct Staged<Q4KTraits> {                                                           // 1152 bytes
-    static constexpr int C = 8, MAX_COLS = 3, ROLL = 9;
+    static constexpr int C = 8, MAX_COLS = 3, ROLL = 9, ROWC = 0;
     // slot s = kqs / 2 % 4 of a Q8_1 block: its ints s and s + 4 and the scale.  6 slots of 16 bytes a block, so
     // the two blocks a quarter-warp reads (two apart) fall in different banks.
     static constexpr int XREC = 96, XSLOTS = 4;
@@ -1679,7 +1690,7 @@ template<> struct Staged<Q4KTraits> {                                           
     }
 };
 template<> struct Staged<Q6KTraits> {                                                           // 1680 bytes
-    static constexpr int C = 8, MAX_COLS = 8, ROLL = 2;
+    static constexpr int C = 8, MAX_COLS = 8, ROLL = 2, ROWC = 12;
     // int q = 0..7 of a Q8_1 block with the scale
     static constexpr int XREC = 64, XSLOTS = 8;
     __device__ static void put(uint8_t* rec, const Q81Block* __restrict__ b, int s) {
@@ -1697,9 +1708,19 @@ template<> struct Staged<Q6KTraits> {                                           
         }
         return v;
     }
+    // Q6KTraits::dot with the scale product taken in 16 bits: the dp4a of four 6-bit weights (-32..31) and four
+    // int8 activations lies in -16256..16384, so (short) keeps it whole and the one-instruction 16 x 16-bit multiply
+    // gives the same int as the 32-bit one (three instructions on sm_61).  The one-chunk rows only: 2560 -> 248320
+    // at 2 / 3 / 4 / 5 columns 2697 -> 2431, 3218 -> 3053, 4325 -> 4041, 4850 -> 4422 us, before the other changes.
+    __device__ static float dot(const Q6KTraits::W& r, const Q6KTraits::X& v) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) sumf += v.d8[i] * (int(short(GUILD_DP4A(r.vi[i], v.u[i], 0))) * int(r.sc[i]));
+        return float(r.d) * sumf;
+    }
 };
 template<> struct Staged<SmallTraits<Q80Block, 8>> {                                            // 1088 bytes
-    static constexpr int C = 32, MAX_COLS = 4, ROLL = 9, XREC = 0;
+    static constexpr int C = 32, MAX_COLS = 4, ROLL = 9, ROWC = 0, XREC = 0;
 };
 // the bytes of shared memory a column's activations take, as records (XR) or as Q8_1 blocks
 template<typename F, bool XR>
@@ -1708,15 +1729,26 @@ __host__ __device__ constexpr int staged_xcol(int n_in) {
 }
 constexpr int STAGED_NW = 8; // warps a block
 
-template<typename F, int NCOLS, bool XR>
-__launch_bounds__(STAGED_NW * WARP)
+// the bytes of shared memory a warp stages a chunk in: its 16-byte pieces, and one more where the row starts inside
+// a piece.  A kernel whose rows are one chunk each (C > Staged<F>::C) takes only the row's.
+template<typename F, int C>
+__host__ __device__ constexpr int staged_wbytes(int n_in) {
+    constexpr int CB = C * int(sizeof(typename F::Block));
+    return C == Staged<F>::C ? CB + 16 : (n_in / F::DIV * int(sizeof(typename F::Block)) + 30) / 16 * 16;
+}
+
+template<typename F, int NCOLS, bool XR, int C>
+__launch_bounds__(STAGED_NW * WARP, C != Staged<F>::C ? 1 : 0)
 __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x,
                                           float* __restrict__ y, int n_in, int n_out) {
     using Block = typename F::Block;
-    constexpr int BS = int(sizeof(Block)), C = Staged<F>::C, CB = C * BS;
+    // ONE: every row is one chunk (the host checked n_in / F::DIV <= C, see Staged::ROWC), so a chunk need not be
+    // whole 16-byte pieces
+    constexpr bool ONE = C != Staged<F>::C;
+    constexpr int BS = int(sizeof(Block)), CB = C * BS;
     // 16-byte pieces a lane carries: a chunk's, and one more where the row starts inside a piece
-    constexpr int KV = (CB / 16 + 1 + WARP - 1) / WARP;
-    static_assert(CB % 16 == 0 && C % F::BPI == 0 && F::BPI * F::T == WARPS * WARP && WARP % F::T == 0,
+    constexpr int KV = ((CB + 30) / 16 + WARP - 1) / WARP;
+    static_assert((ONE || CB % 16 == 0) && C % F::BPI == 0 && F::BPI * F::T == WARPS * WARP && WARP % F::T == 0,
                   "a chunk must be whole 16-byte pieces and whole steps of the ncols = 1 kernel");
     extern __shared__ __align__(16) uint8_t smem[];
     const int nb = n_in / F::DIV, xb = n_in / Q8K, xcol = staged_xcol<F, XR>(n_in), xbytes = NCOLS * xcol;
@@ -1738,10 +1770,10 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
     int r = int(blockIdx.x) * STAGED_NW + warp; // this warp's rows: r, r + rstep, ...
     if (r >= n_out) return;
     const Q81Block* xs = reinterpret_cast<const Q81Block*>(smem);
-    uint8_t* sm = smem + (xbytes + 15) / 16 * 16 + warp * (CB + 16);
+    uint8_t* sm = smem + (xbytes + 15) / 16 * 16 + warp * staged_wbytes<F, C>(n_in);
     const std::size_t rb = std::size_t(nb) * BS;
     const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(w), end = base + std::size_t(n_out) * rb;
-    const int nchunk = (nb + C - 1) / C, rstep = int(gridDim.x) * STAGED_NW;
+    const int nchunk = ONE ? 1 : (nb + C - 1) / C, rstep = int(gridDim.x) * STAGED_NW;
     // the aligned pieces under chunk c of row rr: the host checked that w is 16-byte aligned, so only the matrix's
     // last piece can run past its end, and that one is read in 2-byte parts
     auto pieces = [&](int rr, int c, std::uintptr_t& a0) {
@@ -1770,23 +1802,49 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
             }
         }
     };
+    // ONE: a warp's rows are rstep apart, so the next row's address is this one's plus rstep rows (no 64-bit product
+    // a row), and a row's pieces are read without a test each unless they reach the matrix's last piece
+    const std::uintptr_t rsb = std::uintptr_t(rstep) * rb;
+    std::uintptr_t g = base + std::size_t(r) * rb; // row r's first byte (ONE)
+    auto fetch1 = [&](std::uintptr_t g0, int rr) {
+        const std::uintptr_t a0 = g0 & ~std::uintptr_t(15);
+        const int n = int((g0 + rb - a0 + 15) / 16);
+        if (a0 + 16 * std::uintptr_t(n) <= end) {
+#pragma unroll
+            for (int k = 0; k < KV; ++k)
+                if (lane + WARP * k < n) pf[k] = __ldg(reinterpret_cast<const int4*>(a0) + lane + WARP * k);
+        } else {
+            fetch(rr, 0);
+        }
+    };
     float acc[NCOLS][WARPS];
 #pragma unroll
     for (int j = 0; j < NCOLS; ++j)
 #pragma unroll
         for (int t = 0; t < WARPS; ++t) acc[j][t] = 0.0f;
-    fetch(r, 0);
+    if constexpr (ONE)
+        fetch1(g, r);
+    else
+        fetch(r, 0);
     for (int c = 0;;) {
         std::uintptr_t a0;
-        const int n = pieces(r, c, a0);
+        int n;
+        if constexpr (ONE)
+            n = int((g + rb - (g & ~std::uintptr_t(15)) + 15) / 16);
+        else
+            n = pieces(r, c, a0);
         __syncwarp();
 #pragma unroll
         for (int k = 0; k < KV; ++k)
             if (lane + WARP * k < n) reinterpret_cast<int4*>(sm)[lane + WARP * k] = pf[k];
         __syncwarp();
         const int nr = c + 1 < nchunk ? r : r + rstep, nc = c + 1 < nchunk ? c + 1 : 0;
-        if (nr < n_out) fetch(nr, nc);
-        const uint8_t* sb = sm + int((base + std::size_t(r) * rb) & 15);
+        if constexpr (ONE) {
+            if (nr < n_out) fetch1(g + rsb, nr);
+        } else {
+            if (nr < n_out) fetch(nr, nc);
+        }
+        const uint8_t* sb = sm + int((ONE ? g : base + std::size_t(r) * rb) & 15);
         // the ncols = 1 kernel's thread WARP * t + lane: its blocks of this chunk into sum t
         auto step = [&](int t, int s) {
             const int tid = WARP * t + lane, kqs = F::kqs(tid);
@@ -1797,7 +1855,11 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
                     const typename F::W wv = F::load(reinterpret_cast<const Block*>(sb + b * BS), kqs);
 #pragma unroll
                     for (int j = 0; j < NCOLS; ++j) {
-                        if constexpr (XR)
+                        if constexpr (ONE && XR)
+                            acc[j][s] += Staged<F>::dot(wv, Staged<F>::get(smem + j * xcol, kbx, kqs));
+                        else if constexpr (ONE)
+                            acc[j][s] += Staged<F>::dot(wv, F::load_x(xs + j * xb + kbx * F::KBY, kqs));
+                        else if constexpr (XR)
                             acc[j][s] += F::dot(wv, Staged<F>::get(smem + j * xcol, kbx, kqs));
                         else
                             acc[j][s] += F::apply(wv, xs + j * xb + kbx * F::KBY, kqs);
@@ -1805,7 +1867,36 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
                 }
             }
         };
-        if constexpr (NCOLS >= Staged<F>::ROLL) {
+        if constexpr (ONE) {
+            // the row is this one chunk, so sum t is whole after step t: a running total adds the four sums in the
+            // same order, ((0 + 1) + 2) + 3, without keeping them apart (half the accumulators, none rotated)
+            float tot[NCOLS];
+            auto add = [&](int t) {
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    tot[j] = t == 0 ? acc[j][0] : tot[j] + acc[j][0];
+                    acc[j][0] = 0.0f;
+                }
+            };
+            if constexpr (NCOLS >= Staged<F>::ROLL) {
+#pragma unroll 1
+                for (int t = 0; t < WARPS; ++t) {
+                    step(t, 0);
+                    add(t);
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < WARPS; ++t) {
+                    step(t, 0);
+                    add(t);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                const float v = warp_sum(tot[j]);
+                if (lane == 0) y[std::size_t(j) * n_out + r] = v;
+            }
+        } else if constexpr (NCOLS >= Staged<F>::ROLL) {
 #pragma unroll 1
             for (int t = 0; t < WARPS; ++t) {
                 step(t, 0);
@@ -1821,7 +1912,7 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
 #pragma unroll
             for (int t = 0; t < WARPS; ++t) step(t, t);
         }
-        if (c + 1 == nchunk) {
+        if (!ONE && c + 1 == nchunk) {
 #pragma unroll
             for (int j = 0; j < NCOLS; ++j) {
                 float v = acc[j][0];
@@ -1836,6 +1927,7 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
         if (nr >= n_out) break;
         r = nr;
         c = nc;
+        if constexpr (ONE) g += rsb;
     }
 }
 
@@ -1847,7 +1939,7 @@ thread_local StagedDevice g_staged_dev;
 // As many blocks as the GPU holds at once, and every warp the same number of rows (a warp takes every
 // (blocks x 8)-th row): a warp's next row loads while it finishes the last, and a block copies the activations once
 // for all its rows.  The blocks a GPU holds depend on the shared memory, so they are kept per KiB of it.
-template<typename F, int NCOLS, bool XR>
+template<typename F, int NCOLS, bool XR, int C>
 void staged_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, std::size_t smem,
                      cudaStream_t s) {
     thread_local int dev_of = -1, resident[49] = {};
@@ -1858,32 +1950,34 @@ void staged_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in
     int& held = resident[(smem + 1023) / 1024];
     if (held == 0) {
         int per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, native_mmvq_staged_kernel<F, NCOLS, XR>,
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, native_mmvq_staged_kernel<F, NCOLS, XR, C>,
                                                       STAGED_NW * WARP, (smem + 1023) / 1024 * 1024);
         held = per_sm > 0 ? g_staged_dev.sms * per_sm : 1;
     }
     const std::size_t per_pass = std::size_t(STAGED_NW) * held, rows = (std::size_t(n_out) + per_pass - 1) / per_pass;
     const unsigned blocks = unsigned((std::size_t(n_out) + STAGED_NW * rows - 1) / (STAGED_NW * rows));
-    native_mmvq_staged_kernel<F, NCOLS, XR><<<blocks, STAGED_NW * WARP, smem, s>>>(
+    native_mmvq_staged_kernel<F, NCOLS, XR, C><<<blocks, STAGED_NW * WARP, smem, s>>>(
         static_cast<const uint8_t*>(weights), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
 }
 
-// staged_launch_n<F, ncols, xr> for NCOLS <= ncols <= the format's MAX_COLS
-template<typename F, int NCOLS>
+// staged_launch_n<F, ncols, xr, C> for NCOLS <= ncols <= the format's MAX_COLS
+template<typename F, int C, int NCOLS>
 void staged_launch(int ncols, bool xr, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
                    std::size_t smem, cudaStream_t s) {
     if constexpr (NCOLS <= Staged<F>::MAX_COLS) {
         if (ncols != NCOLS)
-            staged_launch<F, NCOLS + 1>(ncols, xr, weights, x_q8_1, y, n_in, n_out, smem, s);
+            staged_launch<F, C, NCOLS + 1>(ncols, xr, weights, x_q8_1, y, n_in, n_out, smem, s);
         else if constexpr (Staged<F>::XREC > 0 && NCOLS > 1)
             if (xr)
-                staged_launch_n<F, NCOLS, true>(weights, x_q8_1, y, n_in, n_out, smem, s);
+                staged_launch_n<F, NCOLS, true, C>(weights, x_q8_1, y, n_in, n_out, smem, s);
             else
-                staged_launch_n<F, NCOLS, false>(weights, x_q8_1, y, n_in, n_out, smem, s);
+                staged_launch_n<F, NCOLS, false, C>(weights, x_q8_1, y, n_in, n_out, smem, s);
         else
-            staged_launch_n<F, NCOLS, false>(weights, x_q8_1, y, n_in, n_out, smem, s);
+            staged_launch_n<F, NCOLS, false, C>(weights, x_q8_1, y, n_in, n_out, smem, s);
     }
 }
+// GUILD_MMVQ_ROW_CHUNK=0: rows of C < blocks <= ROWC in chunks of C, as before the one-chunk kernels (Staged::ROWC)
+bool g_row_chunk_off = std::getenv("GUILD_MMVQ_ROW_CHUNK") && std::string(std::getenv("GUILD_MMVQ_ROW_CHUNK")) == "0";
 
 // false: the caller takes its usual path
 template<typename F>
@@ -1895,14 +1989,17 @@ bool staged_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, in
         if (g_staged_off || ncols > Staged<F>::MAX_COLS || (ncols > 1 && !g_multi_exact) ||
             reinterpret_cast<std::uintptr_t>(weights) % 16 != 0)
             return false;
-        constexpr int CB = Staged<F>::C * int(sizeof(typename F::Block));
+        const int nb = n_in / F::DIV;
+        const bool one = Staged<F>::ROWC > 0 && !g_row_chunk_off && nb > Staged<F>::C && nb <= Staged<F>::ROWC;
+        const int wbytes = one ? staged_wbytes<F, Staged<F>::ROWC>(n_in) : staged_wbytes<F, Staged<F>::C>(n_in);
         auto smem_of = [&](bool xr) {
             const std::size_t xbytes = std::size_t(ncols) * std::size_t(xr ? staged_xcol<F, true>(n_in)
                                                                             : staged_xcol<F, false>(n_in));
-            return (xbytes + 15) / 16 * 16 + std::size_t(STAGED_NW) * (CB + 16);
+            return (xbytes + 15) / 16 * 16 + std::size_t(STAGED_NW) * wbytes;
         };
-        // one column: the Q8_1 blocks (the records measured the same there, so no second kernel)
-        const bool xr = Staged<F>::XREC > 0 && ncols > 1 && smem_of(true) <= 32 * 1024;
+        // one column: the Q8_1 blocks (the records measured the same there, so no second kernel); the one-chunk
+        // kernels take the records whenever they fit (Staged::ROWC)
+        const bool xr = Staged<F>::XREC > 0 && ncols > 1 && smem_of(true) <= std::size_t(one ? 48 : 32) * 1024;
         const std::size_t smem = smem_of(xr);
         if (smem > 48 * 1024) return false; // every column's activations beside the rows, without an opt-in
         int dev = 0;
@@ -1917,7 +2014,14 @@ bool staged_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, in
         if (std::size_t(n_out) * (n_in / F::DIV) * sizeof(typename F::Block) <
             std::size_t(g_staged_dev.sms) * 100 * 1024)
             return false;
-        staged_launch<F, 1>(ncols, xr, weights, x_q8_1, y, n_in, n_out, smem, static_cast<cudaStream_t>(stream));
+        if constexpr (Staged<F>::ROWC > 0)
+            if (one) {
+                staged_launch<F, Staged<F>::ROWC, 1>(ncols, xr, weights, x_q8_1, y, n_in, n_out, smem,
+                                                     static_cast<cudaStream_t>(stream));
+                return true;
+            }
+        staged_launch<F, Staged<F>::C, 1>(ncols, xr, weights, x_q8_1, y, n_in, n_out, smem,
+                                          static_cast<cudaStream_t>(stream));
         return true;
     }
 }
