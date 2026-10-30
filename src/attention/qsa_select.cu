@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #ifndef GUILD_CUDA_ATTN_MATH_NS
 #define GUILD_CUDA_ATTN_MATH_NS guild::kernels
@@ -716,6 +718,302 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
         run_sel += __shfl_sync(0xffffffffu, ps, 31);
     }
 }
+
+// ---- the decode top-k over several CTAs per query (below sm_90: no clusters).  The one-CTA kernels run a decode
+// window's 1-4 queries on 1-4 of the card's SMs: on a GTX 1070, block_topk_wide_kernel took 76 us for one query of a
+// 128K context and 131 us at 256K (capacity 262,144), against 33 and 39 us here (qsa_topk_parity, no block count).
+// Pass 1 (block_topk_split_kernel): CTA g of a query takes a contiguous slice of its blocks, holds their keys in
+// registers and selects the slice's own `width` cells by the rule; it lists the blocks those cells lie in (whole
+// blocks, ascending, with their keys) in a scratch slot.  Pass 2 (block_topk_merge_kernel): one CTA per query applies
+// the rule to the concatenated lists and writes the cells.
+//
+// IDENTICAL IDS, by construction: let S be the rule's selection over all cells, the first `width` cells in the order
+// (key descending, index ascending).  Fewer than `width` cells come before a cell of S in that order, so fewer within
+// its slice: it is in its slice's selection, and S lies in the union U of the lists (a listed block's other cells only
+// add cells).  The rule applied to any U with S in U, and U in all cells, selects S again, since S's cells come first
+// in U as they do in all cells.  The threshold and `above` are integer histograms and the digit rule is
+// block_topk_kernel's, so each pass is a pure function of its keys; the lists, concatenated in slice order, are
+// ascending, and the merge writes the cells ascending.  NaN keys are 0 (order_key) as everywhere.
+constexpr int SP_T = 512;                 // threads per CTA, both kernels
+constexpr int SP_W = SP_T / 32;
+constexpr int SP_G = 8;                   // slices per query, at most
+constexpr int SP_MIN = 2048;              // blocks per slice, at least, while the call's CTAs fit the card
+constexpr int SP_ROWS = 17;               // rows of 32 keys a warp holds in pass 1: slices of up to 8,704 blocks
+constexpr int SP_ROWS2 = 9;               // pass 2: up to 4,608 listed blocks
+constexpr int SP_MAXQ = 8;                // queries per call (a decode window)
+
+// the slices of a query with nbe candidate blocks (both kernels compute it from the query's own step record): one per
+// SP_MIN blocks, at most `gmax` (the host's SMs / queries, so that a call's CTAs fit the card at once: one 512-thread
+// CTA of pass 1 fills an SM's registers), yet enough for SP_ROWS rows a warp
+__device__ __forceinline__ int sp_slices(int64_t nbe, int gmax) {
+    int64_t g = (nbe + SP_MIN - 1) / SP_MIN;
+    if (g > gmax) g = gmax;
+    const int64_t need = (nbe + SP_T * SP_ROWS - 1) / (SP_T * SP_ROWS);
+    if (g < need) g = need;
+    return g < 1 ? 1 : (g > SP_G ? SP_G : (int) g);
+}
+
+// The rule's threshold over the items a CTA holds as rows of 32 per warp: item w * 32 * rows + j * 32 + lane is
+// key[j] of that lane, items from n on are absent, `wt(j)` the cells of the lane's item in row j.  The digit rule is
+// block_topk_kernel's (the largest digit whose cells at or above it reach `need`, 0 when none), searched by warp 0 as
+// the cluster kernel does.  Returns thr; `above` = the cells with a larger key.
+template <int ROWS, typename Wt>
+__device__ __forceinline__ uint32_t sp_threshold(const uint32_t (&key)[ROWS], int rows, int n, int64_t width, Wt wt,
+                                                 int (*hist)[256], int* s_res, int& above) {
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int base = warp * 32 * rows + lane;
+    uint32_t prefix = 0;
+    above = 0;
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        const uint32_t hmask = pass == 0 ? 0u : (0xffffffffu << (shift + 8));
+        for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < ROWS; ++j) {
+            if (j >= rows) break;
+            if (base + j * 32 < n && (key[j] & hmask) == prefix) atomicAdd(&hist[warp][(key[j] >> shift) & 255], wt(j));
+        }
+        __syncthreads();
+        if (t < 256) {                                // fold the warps' histograms into warp 0's
+            int s = 0;
+            for (int w2 = 0; w2 < SP_W; ++w2) s += hist[w2][t];
+            hist[0][t] = s;
+        }
+        __syncthreads();
+        if (warp == 0) {                              // lane L owns digits 255 - 8L down to 248 - 8L
+            const int need = (int) width - above;
+            int tot[8], part = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                tot[k] = hist[0][255 - 8 * lane - k];
+                part += tot[k];
+            }
+            int incl = part;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += y;
+            }
+            const int excl = incl - part;
+            const unsigned hit = __ballot_sync(0xffffffffu, excl < need && incl >= need);
+            const int who = hit ? __ffs(hit) - 1 : 31;
+            if (lane == who) {
+                int acc = excl, k = 0;
+                for (; k < 7; ++k) {
+                    if (acc + tot[k] >= need) break;
+                    acc += tot[k];
+                }
+                s_res[0] = 255 - 8 * lane - k;
+                s_res[1] = acc;
+            }
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_res[0] << shift;
+        above += s_res[1];
+    }
+    return prefix;
+}
+
+// grid (SP_G, nq), SP_T threads: slice g of query q into list slot (q, g) of `lists` (cand entries of key and block)
+// and its length into counts[q * SP_G + g].  Nothing for a query whose cells all fit its width (the merge writes the
+// identity) or a slice past its sp_slices.
+__global__ void __launch_bounds__(SP_T) block_topk_split_kernel(const float* __restrict__ scores,
+                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                                int gmax, int cand, uint2* __restrict__ lists,
+                                                                int* __restrict__ counts) {
+    __shared__ int hist[SP_W][256];
+    __shared__ int s_res[2];
+    __shared__ int s_a[SP_W], s_b[SP_W];
+    const int g = blockIdx.x, qi = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int32_t* st = steps + (int64_t) qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    if (n_kv <= width) return;
+    const int wtail = (int) (n_kv - n_bid * R);       // the tail block's cells (0..3); with none it is no candidate
+    const int64_t nbe = n_bid + (wtail > 0 ? 1 : 0);
+    const int G = sp_slices(nbe, gmax);
+    if (g >= G) return;
+    const int64_t per = (nbe + G - 1) / G;
+    const int64_t lo = (int64_t) g * per, hi = lo + per < nbe ? lo + per : nbe;
+    const int n = (int) (hi - lo);
+    const int rows = (n + SP_T - 1) / SP_T;           // <= SP_ROWS: the host admits contexts up to SP_G * 8,704 blocks
+    const int tail_i = (wtail > 0 && n_bid >= lo && n_bid < hi) ? (int) (n_bid - lo) : -1;
+    const float* sc = scores + (int64_t) qi * max_blocks + lo;
+    const int base = warp * 32 * rows + lane;         // warp w holds items [w * 32 * rows, (w + 1) * 32 * rows)
+    uint32_t key[SP_ROWS];
+#pragma unroll
+    for (int j = 0; j < SP_ROWS; ++j) key[j] = (j < rows && base + j * 32 < n) ? order_key(sc[base + j * 32]) : 0u;
+    auto wt = [&](int j) -> int { return base + j * 32 == tail_i ? wtail : R; };
+    uint2* out = lists + ((int64_t) qi * SP_G + g) * cand;
+    const int64_t cells = (int64_t) n * R - (tail_i >= 0 ? R - wtail : 0);
+    uint32_t thr = 0;
+    int eq_budget = 0;
+    const bool all = cells <= width;                  // every block of the slice is listed
+    if (!all) {
+        int above = 0;
+        thr = sp_threshold<SP_ROWS>(key, rows, n, width, wt, hist, s_res, above);
+        eq_budget = (int) (width - above);            // cells at thr that fit, lowest index first
+    }
+    // per warp: its cells at thr; then the tied cells of the warps before it
+    int eq = 0;
+#pragma unroll
+    for (int j = 0; j < SP_ROWS; ++j) {
+        if (j < rows && base + j * 32 < n && !all && key[j] == thr) eq += wt(j);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) eq += __shfl_xor_sync(0xffffffffu, eq, o);
+    if (lane == 0) s_a[warp] = eq;
+    __syncthreads();
+    if (t == 0) {
+        int eb = 0;
+        for (int w2 = 0; w2 < SP_W; ++w2) { const int e2 = s_a[w2]; s_a[w2] = eb; eb += e2; }
+    }
+    __syncthreads();
+    // a block is listed when its key is above thr, or at thr with fewer than eq_budget tied cells before it.  Twice:
+    // count the warp's listed blocks, then (with the warps before it counted) write them.
+    for (int write = 0; write < 2; ++write) {
+        int run_eq = s_a[warp], run_n = write ? s_b[warp] : 0;
+#pragma unroll
+        for (int j = 0; j < SP_ROWS; ++j) {
+            if (j >= rows) break;
+            const int item = base + j * 32;
+            const bool in = item < n;
+            const int my_eq = (in && !all && key[j] == thr) ? wt(j) : 0;
+            int pe = my_eq;                           // tied cells up to and with this lane
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, pe, o);
+                if (lane >= o) pe += y;
+            }
+            const bool listed = in && (all || key[j] > thr || (my_eq > 0 && run_eq + pe - my_eq < eq_budget));
+            const unsigned m = __ballot_sync(0xffffffffu, listed);
+            if (write && listed)
+                out[run_n + __popc(m & ((1u << lane) - 1u))] = make_uint2(key[j], (uint32_t) (lo + item));
+            run_n += __popc(m);
+            run_eq += __shfl_sync(0xffffffffu, pe, 31);
+        }
+        if (!write) {
+            if (lane == 0) s_b[warp] = run_n;
+            __syncthreads();
+            if (t == 0) {
+                int nb = 0;
+                for (int w2 = 0; w2 < SP_W; ++w2) { const int c2 = s_b[w2]; s_b[w2] = nb; nb += c2; }
+                counts[qi * SP_G + g] = nb;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// grid (nq), SP_T threads: the rule over query q's lists, the cells ascending into ids (or the identity)
+__global__ void __launch_bounds__(SP_T) block_topk_merge_kernel(const int32_t* __restrict__ steps, int64_t cap,
+                                                                int gmax, int cand,
+                                                                const uint2* __restrict__ lists,
+                                                                const int* __restrict__ counts,
+                                                                int32_t* __restrict__ ids) {
+    __shared__ int hist[SP_W][256];
+    __shared__ int s_res[2];
+    __shared__ int s_off[SP_G + 1];
+    __shared__ int s_gt[SP_W], s_eq[SP_W];
+    const int qi = blockIdx.x;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int32_t* st = steps + (int64_t) qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    int32_t* out = ids + (int64_t) qi * cap;
+    if (n_kv <= width) {                              // everything is selected: the identity, ascending
+        for (int64_t j = t; j < n_kv; j += SP_T) out[j] = (int32_t) j;
+        return;
+    }
+    const int wtail = (int) (n_kv - n_bid * R);
+    const int64_t nbe = n_bid + (wtail > 0 ? 1 : 0);
+    const int G = sp_slices(nbe, gmax);
+    if (t == 0) {
+        int o = 0;
+        for (int g = 0; g < G; ++g) { s_off[g] = o; o += counts[qi * SP_G + g]; }
+        s_off[G] = o;
+    }
+    __syncthreads();
+    const int n = s_off[G];
+    const int rows = (n + SP_T - 1) / SP_T;           // <= SP_ROWS2 (the host checks SP_G * cand)
+    const int base = warp * 32 * rows + lane;
+    uint32_t key[SP_ROWS2];
+    int32_t blk[SP_ROWS2];
+#pragma unroll
+    for (int j = 0; j < SP_ROWS2; ++j) {
+        const int item = base + j * 32;
+        key[j] = 0u;
+        blk[j] = -1;
+        if (j < rows && item < n) {
+            int g = 0;
+            while (item >= s_off[g + 1]) ++g;
+            const uint2 e = lists[((int64_t) qi * SP_G + g) * cand + (item - s_off[g])];
+            key[j] = e.x;
+            blk[j] = (int32_t) e.y;
+        }
+    }
+    // a listed item weighs its block's cells
+    auto wt_of = [&](int32_t b) -> int { return b == n_bid ? wtail : R; };
+    int above = 0;
+    const uint32_t thr = sp_threshold<SP_ROWS2>(key, rows, n, width, [&](int j) -> int { return wt_of(blk[j]); },
+                                                hist, s_res, above);
+    const int eq_budget = (int) (width - above);      // cells equal to thr that fit, lowest index first
+    int gt = 0, eq = 0;
+#pragma unroll
+    for (int j = 0; j < SP_ROWS2; ++j) {
+        if (j < rows && base + j * 32 < n) {
+            const int w = wt_of(blk[j]);
+            if (key[j] > thr) gt += w;
+            else if (key[j] == thr) eq += w;
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gt += __shfl_xor_sync(0xffffffffu, gt, o);
+        eq += __shfl_xor_sync(0xffffffffu, eq, o);
+    }
+    if (lane == 0) { s_gt[warp] = gt; s_eq[warp] = eq; }
+    __syncthreads();
+    if (t == 0) {                                     // per warp: the selected cells and the tied cells before it
+        int eb = 0, sb = 0;
+        for (int w2 = 0; w2 < SP_W; ++w2) {
+            const int g2 = s_gt[w2], e2 = s_eq[w2];
+            const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
+            s_gt[w2] = sb;
+            s_eq[w2] = eb;
+            sb += g2 + take;
+            eb += e2;
+        }
+    }
+    __syncthreads();
+    int run_sel = s_gt[warp], run_eq = s_eq[warp];
+#pragma unroll
+    for (int j = 0; j < SP_ROWS2; ++j) {
+        if (j >= rows) break;
+        const bool in = base + j * 32 < n;
+        const int w = in ? wt_of(blk[j]) : 0;
+        const int my_gt = (w && key[j] > thr) ? w : 0, my_eq = (w && key[j] == thr) ? w : 0;
+        int pe = my_eq;                               // tied cells up to and with this lane
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, pe, o);
+            if (lane >= o) pe += y;
+        }
+        const int left = eq_budget - (run_eq + pe - my_eq);
+        const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+        const int my_sel = my_gt + take;
+        int ps = my_sel;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, ps, o);
+            if (lane >= o) ps += y;
+        }
+        int32_t* dst = out + run_sel + ps - my_sel;
+        for (int c = 0; c < my_sel; ++c) dst[c] = blk[j] * R + c;
+        run_eq += __shfl_sync(0xffffffffu, pe, 31);
+        run_sel += __shfl_sync(0xffffffffu, ps, 31);
+    }
+}
 #endif
 
 
@@ -991,6 +1289,44 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
 #endif  // !__HIPCC__
 }  // namespace
 
+#if !defined(__HIPCC__)
+// An env switch, read once by the caller: -1 when unset or empty, else its value
+static int env_switch(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] != '\0' ? std::atoi(v) : -1;
+}
+// The current device's compute capability (major) and SM count, read once per device; zeros when unreadable
+struct SelDevice {
+    int cc = 0, sms = 0;
+};
+static SelDevice sel_device() {
+    static std::mutex mu;
+    static SelDevice info[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return SelDevice{};
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    if (info[dev].cc == 0) {
+        int major = 0, sms = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return SelDevice{};
+        }
+        info[dev].cc = guild::cc_major_of(major);
+        info[dev].sms = sms;
+    }
+    return info[dev];
+}
+// A kernel measured on one card: env 0 never, 1 on any CUDA card, -1 (unset) on compute capability 6.x only (the
+// GTX 1070 it was measured on)
+static bool cc6_default(int env) {
+    return env >= 0 ? env != 0 : sel_device().cc == 6;
+}
+#endif
+
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
     if (nq <= 0) return;
@@ -1174,6 +1510,84 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 #endif
 }
 
+#if !defined(__HIPCC__)
+// The split top-k's lists, one buffer per (device, stream) as the sampler's split_scratch keeps them: launches on one
+// stream run in order, so a stream reuses its buffer with no sync, and two streams never share one.  The engine's
+// first call is inside a graph capture, so the allocation runs with the thread's capture mode relaxed (cudaMalloc is
+// not a stream operation; the capture is unaffected).  A grown-out buffer is retired, not freed: a captured graph may
+// still hold it.  Nothing needs zeroing: the merge reads only the lists and counts the same call's split wrote.
+static bool topk_split_scratch(void* stream, int cand, uint2*& lists, int*& counts) {
+    struct Slot {
+        int device;
+        void* stream;
+        uint8_t* ptr;
+        int cand;
+    };
+    static std::mutex mu;
+    static std::vector<Slot> slots;
+    static std::vector<uint8_t*> retired;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    Slot* slot = nullptr;
+    for (Slot& x : slots)
+        if (x.device == device && x.stream == stream) slot = &x;
+    if (slot == nullptr) {
+        slots.push_back({device, stream, nullptr, 0});
+        slot = &slots.back();
+    }
+    const size_t list_bytes = (size_t) SP_MAXQ * SP_G * (size_t) cand * sizeof(uint2);
+    if (slot->cand < cand) {
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        cudaThreadExchangeStreamCaptureMode(&mode);
+        uint8_t* p = nullptr;
+        const cudaError_t e = cudaMalloc(&p, list_bytes + (size_t) SP_MAXQ * SP_G * sizeof(int));
+        cudaThreadExchangeStreamCaptureMode(&mode);
+        if (e != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        if (slot->ptr != nullptr) retired.push_back(slot->ptr);
+        slot->ptr = p;
+        slot->cand = cand;
+    }
+    lists = reinterpret_cast<uint2*>(slot->ptr);
+    counts = reinterpret_cast<int*>(slot->ptr + (size_t) SP_MAXQ * SP_G * (size_t) slot->cand * sizeof(uint2));
+    return true;
+}
+
+// A decode window's call (a few queries, no block count) on the split kernels; false: the caller's one-CTA kernels
+static bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                                 const QsaShapes& s, int32_t* ids, void* stream) {
+    // GUILD_TOPK_SPLIT=0: the one-CTA kernels
+    static const int env = env_switch("GUILD_TOPK_SPLIT");
+    if (nq <= 0 || nq > SP_MAXQ || s.idx_block != R || !cc6_default(env)) return false;
+    // a query's blocks (<= max_blocks - 1) in SP_G slices of at most SP_ROWS rows; SP_G lists within SP_ROWS2 rows
+    const int64_t wmax = qsa_selection_width(kTopkMaxCells, s);
+    const int cand = (int) ((wmax + R - 1) / R + 2);
+    if (max_blocks - 1 > (int64_t) SP_G * SP_T * SP_ROWS || (int64_t) SP_G * cand > (int64_t) SP_T * SP_ROWS2 ||
+        cap < wmax)
+        return false;
+    uint2* lists = nullptr;
+    int* counts = nullptr;
+    if (!topk_split_scratch(stream, cand, lists, counts)) return false;
+    // slices per query: as many as fit the card's SMs together (one pass-1 CTA an SM), at most SP_G.  On the GTX 1070
+    // (15 SMs), 2 queries of a 128K context: 33 us with 4 slices each against 45 us with 8 (two rounds of CTAs).
+    const int sms = sel_device().sms;
+    const int gmax = sms >= nq ? (int) (sms / nq) : 1;
+    block_topk_split_kernel<<<dim3(SP_G, (unsigned) nq), SP_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks,
+                                                                                         gmax, cand, lists, counts);
+    block_topk_merge_kernel<<<(unsigned) nq, SP_T, 0, (cudaStream_t) stream>>>(steps, cap, gmax, cand, lists, counts,
+                                                                            ids);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk split: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
+}
+#endif
+
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks) {
     // keys in registers when every query's blocks fit (contexts up to ~135K cells), else (CUDA) the same threads
@@ -1189,6 +1603,8 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     }();
     if (cluster && !old && nq <= CL_MAXQ && qsa_block_topk_cluster(scores, steps, nq, max_blocks, cap, s, ids, stream))
         return;
+    // below that: a decode window's call (no block count) over SP_G CTAs per query and a merge; the same ids
+    if (!old && active_blocks <= 0 && qsa_block_topk_split(scores, steps, nq, max_blocks, cap, s, ids, stream)) return;
 #endif
     // the blocks a query can have: the call's active count when the caller knows it (the prompt path), else the capacity.
     // Decode (no count) keeps the capacity rule and the original register width: nothing changes there.
