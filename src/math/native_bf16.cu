@@ -2,6 +2,7 @@
 #include "guild/kernels/bf16_bits.hpp"
 
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -37,6 +38,35 @@ namespace {
 __device__ __forceinline__ float mmvf_warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
+        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+    return value;
+}
+
+__host__ __device__ constexpr int mmvf_log2(int m) { return m <= 1 ? 0 : 1 + mmvf_log2(m / 2); }
+
+// M values a lane (M a power of two, at most 32) summed over the warp by mmvf_warp_sum's xor tree, M at once: at
+// offset 16 a lane keeps half of the values (the upper half when its bit 4 is set) and adds its partner's copy of
+// them, at offset 8 half of those, and so on; then the plain tree over the offsets left.  Every addition is one
+// mmvf_warp_sum makes for that value (own + partner's, both the same partial sums, and a + b == b + a), so lane l
+// returns, bit for bit, mmvf_warp_sum of value l >> (5 - log2 M), with M - 1 + 5 - log2 M shuffles instead of 5 M.
+template <int M>
+__device__ __forceinline__ float mmvf_warp_sum_many(float (&v)[M], int lane) {
+    static_assert(M >= 1 && M <= 32 && (M & (M - 1)) == 0, "1..32 values, a power of two");
+#pragma unroll
+    for (int stage = 0; stage < mmvf_log2(M); ++stage) {
+        const int h = M >> (stage + 1), offset = 16 >> stage;
+        const bool upper = (lane & offset) != 0;
+#pragma unroll
+        for (int i = 0; i < M / 2; ++i) {
+            if (i < h) {
+                const float send = upper ? v[i] : v[i + h], keep = upper ? v[i + h] : v[i];
+                v[i] = keep + __shfl_xor_sync(0xffffffffu, send, offset, 32);
+            }
+        }
+    }
+    float value = v[0];
+#pragma unroll
+    for (int offset = 16 >> mmvf_log2(M); offset > 0; offset >>= 1)
         value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
     return value;
 }
@@ -125,6 +155,134 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t 
             if (k < n_tok) y[(size_t) k * ldy + blockIdx.x] = acc[k];
 }
 
+// R output rows a block, for row counts like a router's (n_out >= 64) and rows of exactly P pairs a thread.  The
+// arithmetic of every output is the kernels' above: thread t's pairs t, t + B, ... in order with two ordered FMAs
+// each, the warp's xor tree, then the B / 32 warp partials summed by the same xor tree with zeros in the other
+// lanes, so each output is bitwise its bf16_f32_mmvf_kernel launch at every column count.  What changes is the
+// schedule: a thread issues the loads of all R x P of its weight words before any arithmetic, and reads each
+// activation pair once for R rows.  The one-row kernels run a block of 256 threads for 5 pairs and a reduction.  In
+// the decode engine on a GTX 1070 (nsys, verify windows), a 512 x 2560 router took 16.1 us at one column and 22.8 at
+// two with them (2.6 MB at 163 and 115 GB/s), 15.0 and 16.9 us with two rows a block; 128 x 2560 6.5 / 10.0 -> 5.6 /
+// 6.1 us, 2560 x 2560 63.9 / 86.5 -> 62.5 / 67.6 us.
+template <int B, int P, int R, int NT>
+__global__ void __launch_bounds__(B) bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t ldx,
+                                                               const uint16_t* __restrict__ w, float* __restrict__ y,
+                                                               int64_t ldy, int n_in, int n_out, int n_tok) {
+    constexpr int NW = B / 32;
+    static_assert(NW >= 2 && B % 32 == 0, "the block reduction needs at least two warps");
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int row0 = blockIdx.x * R;
+    __shared__ float partials[R * NT][32];
+    // lanes NW..31 of every final sum are zeros (the kernels above zero all 32 and overwrite the first NW)
+    for (int i = t; i < R * NT * 32; i += B)
+        if ((i & 31) >= NW) (&partials[0][0])[i] = 0.0f;
+    uint32_t wv[R][P];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        // a partial last block re-reads its last row; those sums are not stored
+        const uint32_t* w2 = reinterpret_cast<const uint32_t*>(w + (size_t) min(row0 + r, n_out - 1) * n_in);
+#pragma unroll
+        for (int p = 0; p < P; ++p) wv[r][p] = w2[t + p * B];
+    }
+    float acc[R][NT];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int k = 0; k < NT; ++k) acc[r][k] = 0.0f;
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            if (k < n_tok) {
+                const float2 input = reinterpret_cast<const float2*>(x + (size_t) k * ldx)[t + p * B];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    acc[r][k] = __fmaf_rn(f32_from_bf16((uint16_t) wv[r][p]), input.x, acc[r][k]);
+                    acc[r][k] = __fmaf_rn(f32_from_bf16((uint16_t) (wv[r][p] >> 16)), input.y, acc[r][k]);
+                }
+            }
+        }
+    }
+    // the warp sums, M = R x NT at once (in chunks of 32), then lane 0 of each value's lanes stores it
+    constexpr int M = R * NT, MC = M < 32 ? M : 32, LC = mmvf_log2(MC);
+#pragma unroll
+    for (int c0 = 0; c0 < M; c0 += MC) {
+        float v[MC];
+#pragma unroll
+        for (int j = 0; j < MC; ++j) v[j] = acc[(c0 + j) / NT][(c0 + j) % NT];
+        const float sum = mmvf_warp_sum_many<MC>(v, lane);
+        if ((lane & ((32 >> LC) - 1)) == 0) partials[c0 + (lane >> (5 - LC))][warp] = sum;
+    }
+    __syncthreads();
+    // the final sums: C values a warp, the same tree with the zero lanes
+    constexpr int C = M > NW ? M / NW : 1, LF = mmvf_log2(C);
+    if (warp * C < M) {
+        float u[C];
+#pragma unroll
+        for (int c = 0; c < C; ++c) u[c] = partials[warp * C + c][lane];
+        const float sum = mmvf_warp_sum_many<C>(u, lane);
+        const int j = warp * C + (lane >> (5 - LF)), r = j / NT, k = j % NT;
+        if ((lane & ((32 >> LF) - 1)) == 0 && k < n_tok && row0 + r < n_out) y[(size_t) k * ldy + row0 + r] = sum;
+    }
+}
+
+// GUILD_MMVF_ROWS: rows a block for the kernel above (1, 2, 4 or 8; 0 = the one-row kernels).  2 by default on
+// CUDA: on a GTX 1070, 512 x 2560 at one, two and four columns took 14.2, 15.6 and 21.7 us a call against 15.1, 21.7
+// and 23.6 for the one-row kernels (mmvf_rows_parity --bench); 4 and 8 rows were slower at two columns.  HIP: opt-in.
+int mmvf_rows() {
+    static const int rows = [] {
+        const char* v = std::getenv("GUILD_MMVF_ROWS");
+#if defined(__HIPCC__)
+        const int r = v ? std::atoi(v) : 0;
+#else
+        const int r = v ? std::atoi(v) : 2;
+#endif
+        return r == 1 || r == 2 || r == 4 || r == 8 ? r : 0;
+    }();
+    return rows;
+}
+
+template <int P, int R>
+void mmvf_rows_launch(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out,
+                      int n_tok, cudaStream_t st) {
+    const unsigned grid = (unsigned) ((n_out + R - 1) / R);
+    if (n_tok == 1)
+        bf16_f32_mmvf_rows_kernel<256, P, R, 1><<<grid, 256, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, 1);
+    else if (n_tok == 2)
+        bf16_f32_mmvf_rows_kernel<256, P, R, 2><<<grid, 256, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, 2);
+    else if (n_tok <= 4)
+        bf16_f32_mmvf_rows_kernel<256, P, R, 4><<<grid, 256, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+    else
+        bf16_f32_mmvf_rows_kernel<256, P, R, 8><<<grid, 256, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+}
+
+template <int P>
+void mmvf_rows_launch(int rows, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in,
+                      int n_out, int n_tok, cudaStream_t st) {
+    switch (rows) {
+        case 1: mmvf_rows_launch<P, 1>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st); break;
+        case 2: mmvf_rows_launch<P, 2>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st); break;
+        case 4: mmvf_rows_launch<P, 4>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st); break;
+        default: mmvf_rows_launch<P, 8>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st); break;
+    }
+}
+
+// the rows kernel when it applies: n_in 2048, 2560 or 4096 (256-thread blocks, the one-row kernels' choice for these
+// widths, and exactly 4, 5 or 8 pairs a thread) and at least 64 rows; false: the caller runs the one-row kernels
+bool mmvf_rows_try(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int64_t n_in,
+                   int64_t n_out, int n_tok, cudaStream_t st) {
+    const int rows = mmvf_rows();
+    if (rows == 0 || n_out < 64 || n_out > std::numeric_limits<int>::max() || n_tok < 1 || n_tok > 8 ||
+        (reinterpret_cast<uintptr_t>(w) & 3u) != 0)
+        return false;
+    switch (n_in) {
+        case 2048: mmvf_rows_launch<4>(rows, x, ldx, w, y, ldy, 2048, (int) n_out, n_tok, st); return true;
+        case 2560: mmvf_rows_launch<5>(rows, x, ldx, w, y, ldy, 2560, (int) n_out, n_tok, st); return true;
+        case 4096: mmvf_rows_launch<8>(rows, x, ldx, w, y, ldy, 4096, (int) n_out, n_tok, st); return true;
+        default: return false;
+    }
+}
+
 int mmvf_block_size(int64_t n_in) {
     int best = 32;
     int64_t best_iterations = (n_in + 63) / 64;
@@ -147,6 +305,12 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
     const cudaStream_t st = (cudaStream_t) stream;
+    if (mmvf_rows_try(x, ldx, w, y, ldy, n_in, n_out, n_tok, st)) {
+        const cudaError_t result = cudaGetLastError();
+        if (result != cudaSuccess)
+            throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
+        return;
+    }
 #define GUILD_MMVF_M(N) case N: \
     if (n_tok <= 4) bf16_f32_mmvf_multi_kernel<N, 4><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); \
     else bf16_f32_mmvf_multi_kernel<N, 8><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break
@@ -171,6 +335,12 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
         (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     const cudaStream_t st = (cudaStream_t) stream;
+    if (mmvf_rows_try(x, n_in, w, y, n_out, n_in, n_out, 1, st)) {
+        const cudaError_t result = cudaGetLastError();
+        if (result != cudaSuccess)
+            throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf launch: ") + cudaGetErrorString(result));
+        return;
+    }
 #define GUILD_MMVF_CASE(N) case N: \
     bf16_f32_mmvf_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in); break
     switch (mmvf_block_size(n_in)) {
