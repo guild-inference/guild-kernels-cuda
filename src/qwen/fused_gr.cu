@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -1110,7 +1111,7 @@ __global__ void __launch_bounds__(DD_WARPS * 32) gr_down_lac_kernel(GrMulti m) {
 
 // ---- The one- and two-token read, second version (GUILD_HC_V2, a bit mask, default 23; 0 = the kernels above):
 // bit 0: the norm in one pass (gr_norm_pf_kernel), with the head of every w_down / w_inject row prefetched into L2
-//        while it runs (GUILD_HC_PF bytes a row, default 4096; 0 = no prefetch);
+//        while it runs (GUILD_HC_PF bytes a row, default 4096, at most a row's 20480; 0 = no prefetch);
 // bit 1: the column up kernel with its next column's loads unconditional (gr_up_cols2_kernel);
 // bit 2: the direct down kernel refilling a ring slot after its chunk is used (gr_down_lac_kernel);
 // bit 4 (with bit 0): the norm's prefetch by blocks of their own (grid y = HC .. HC + 3).
@@ -1225,11 +1226,15 @@ int hc_v2() {
     }();
     return v;
 }
+// at most a whole row (D BF16 values, 160 lines): more would prefetch the next row's head again, and past the end of
+// w_inject's last row, outside its allocation
+constexpr int kHcPfMaxLines = D * 2 / 128;
+static_assert(D * 2 % 128 == 0, "a w_down / w_inject row is a whole number of 128-byte lines");
 int hc_pf_lines() {
     static const int v = [] {
         const char* e = std::getenv("GUILD_HC_PF");
-        const int bytes = e != nullptr ? std::atoi(e) : 4096;
-        return bytes > 0 ? (bytes + 127) / 128 : 0;
+        const long bytes = e != nullptr ? std::atol(e) : 4096;
+        return bytes > 0 ? (int) std::min<long>((bytes + 127) / 128, kHcPfMaxLines) : 0;
     }();
     return v;
 }
