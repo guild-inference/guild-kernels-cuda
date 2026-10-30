@@ -258,8 +258,17 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
     }
 }
 
-template <int G, int KV_MODE>
-__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* __restrict__ q, QsaAttnPools p,
+// TUNED (the default; GUILD_ATTN_TUNED=0 selects the kernel as it was, for A/B): the same operations in the same
+// order, with
+// - each query row padded by 4 floats after every 32 in shared memory, so the score loop's float4 reads (8 lanes 32 B
+//   apart) fall in distinct banks instead of conflicting 4-way;
+// - the value loop taking 8 cells a step: their V loaded first, then folded in cell order as the 4-cell step does;
+// - at most 85 registers, so 3 blocks fit an SM (the untuned kernel's 0 keeps the register allocation it had).
+// GTX 1070, G = 12: ~513 us against ~662 at the draft layer's 32K cells (fp16 K/V, 512 chunks), ~45 against ~55 at
+// 2,051 cells, ~134 against ~160 for 4 queries of 2,051 cells (K8V4).  G = 8 keeps the untuned kernel, where the
+// tuned one was mixed: ~40 us against ~37 at 2,051 cells (fp16), ~110 against ~122 for 4 queries (K8V4).
+template <int G, int KV_MODE, bool TUNED>
+__global__ void __launch_bounds__(THREADS, TUNED ? 3 : 0) attn_chunk_kernel_pre75(const float* __restrict__ q, QsaAttnPools p,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
                                                              int page_size, float scale, float* __restrict__ part_acc,
@@ -273,10 +282,12 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
     part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
     part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
     part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
-    __shared__ __align__(16) float sq[G][HD];     // this KV head's query heads (dead once the scores are done)
+    constexpr int SQS = TUNED ? HD + HD / 8 : HD;  // a query row's floats (TUNED: 4 pad floats after every 32)
+    __shared__ __align__(16) float sqf[G * SQS];    // this KV head's query heads (dead once the scores are done)
+#define SQ(h, j) sqf[(h) * SQS + (j) + (TUNED ? ((j) >> 5) * 4 : 0)]
     __shared__ float sp[G][CHUNK];                // scores
     __shared__ long long srow[CHUNK];             // pool row of each cell (page, kv head, slot)
-    float (*const spt)[G] = reinterpret_cast<float (*)[G]>(&sq[0][0]);
+    float (*const spt)[G] = reinterpret_cast<float (*)[G]>(&sqf[0]);
     static_assert(CHUNK * G <= G * HD, "spt must fit in sq");
     const int n_ids = __ldg(step + kStepWidth);
     const int chunk = blockIdx.x, kvh = blockIdx.y;
@@ -287,7 +298,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
     if (n_here <= 0) {
         return;
     }
-    for (int i = t; i < G * HD; i += THREADS) sq[i / HD][i % HD] = q[(size_t) (kvh * G) * HD + i];
+    for (int i = t; i < G * HD; i += THREADS) SQ(i / HD, i % HD) = q[(size_t) (kvh * G) * HD + i];
     if (t < CHUNK) {
         long long r = -1;
         if (t < n_here) {
@@ -315,8 +326,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
             float pp[NC][G == 8 ? 8 : 16];
 #pragma unroll
             for (int h = 0; h < G; ++h) {
-                const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8]);
-                const float4 qb = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + 4]);
+                const float4 qa = *reinterpret_cast<const float4*>(&SQ(h, lane * 8));
+                const float4 qb = *reinterpret_cast<const float4*>(&SQ(h, lane * 8 + 4));
 #pragma unroll
                 for (int j = 0; j < NC; ++j)
                     pp[j][h] = kk[j][0] * qa.x + kk[j][1] * qa.y + kk[j][2] * qa.z + kk[j][3] * qa.w +
@@ -346,8 +357,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
                 float part[G == 8 ? 8 : 16];
 #pragma unroll
                 for (int h = 0; h < G; ++h) {
-                    const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8]);
-                    const float4 qb = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + 4]);
+                    const float4 qa = *reinterpret_cast<const float4*>(&SQ(h, lane * 8));
+                    const float4 qb = *reinterpret_cast<const float4*>(&SQ(h, lane * 8 + 4));
                     part[h] = k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
                               k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
                 }
@@ -394,6 +405,23 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
         }
     };
     int c = 0;
+    if constexpr (TUNED) {
+        for (; c + 8 <= n_here; c += 8) {
+            long long r[8];
+            long long any = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                r[j] = srow[c + j];
+                any |= r[j];
+            }
+            if (any < 0) break;   // a masked cell: the steps below take it
+            float v[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) v[j] = load_v1<KV_MODE>(p, r[j], t);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) fold(c + j, v[j]);
+        }
+    }
     for (; c + 4 <= n_here; c += 4) {
         const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
         if ((r0 | r1 | r2 | r3) < 0) break;
@@ -411,14 +439,17 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
 #pragma unroll
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
+#undef SQ
 #endif  // GUILD_EXPERIMENTAL_SM60
 
+// The merge as first written: one block per query head, one thread per dimension, the chunks read one at a time.
+// GUILD_ATTN_TUNED=0 selects it (A/B); `attn_merge_kernel` below computes the same bits.
 template <int G>
-__global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict__ part_acc,
-                                                        const float* __restrict__ part_m,
-                                                        const float* __restrict__ part_l,
-                                                        const int32_t* __restrict__ step, int n_chunks,
-                                                        float* __restrict__ attn, long long scratch_stride = 0) {
+__global__ void __launch_bounds__(HD) attn_merge_kernel_serial(const float* __restrict__ part_acc,
+                                                               const float* __restrict__ part_m,
+                                                               const float* __restrict__ part_l,
+                                                               const int32_t* __restrict__ step, int n_chunks,
+                                                               float* __restrict__ attn, long long scratch_stride = 0) {
     part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
     part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
     part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
@@ -440,6 +471,92 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
         acc = fmaf(part_acc[((size_t) slot * G + hl) * HD + d], w, acc);
     }
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
+// The merge with the same operations in the same order per (head, dimension) - the maximum over the chunks, then
+// L and acc as one fmaf chain each in chunk order, skipping empty chunks - but the head's 256 dimensions split over
+// MERGE_SPLIT blocks of 64 threads, so 4x as many blocks share the read, and each thread loads MERGE_UNROLL chunks'
+// partials before it folds them, so their latencies overlap instead of queueing.  GTX 1070, 24 heads: ~98 us against
+// ~231 for the serial one at 512 chunks (the draft layer's 32K cells), ~12 against ~18 at 33 (2,051 cells).
+constexpr int MERGE_SPLIT = 4;
+constexpr int MERGE_UNROLL = 16;
+template <int G>
+__global__ void __launch_bounds__(HD / MERGE_SPLIT) attn_merge_kernel(const float* __restrict__ part_acc,
+                                                                       const float* __restrict__ part_m,
+                                                                       const float* __restrict__ part_l,
+                                                                       const int32_t* __restrict__ step, int n_chunks,
+                                                                       float* __restrict__ attn,
+                                                                       long long scratch_stride = 0) {
+    constexpr int U = MERGE_UNROLL;
+    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
+    const int n_head = (int) gridDim.x / MERGE_SPLIT;
+    attn += (size_t) blockIdx.y * (size_t) n_head * HD;
+    const int n_ids = __ldg(step + (size_t) blockIdx.y * kStepCount + kStepWidth);
+    const int active_chunks = min(n_chunks, (n_ids + CHUNK - 1) / CHUNK);
+    const int h = (int) blockIdx.x / MERGE_SPLIT;    // global query head
+    const int kvh = h / G, hl = h % G;
+    const int d = ((int) blockIdx.x % MERGE_SPLIT) * (HD / MERGE_SPLIT) + (int) threadIdx.x;
+    const float* pm = part_m + (size_t) kvh * n_chunks * G + hl;          // chunk c at pm[c * G]
+    const float* pl = part_l + (size_t) kvh * n_chunks * G + hl;
+    const float* pa = part_acc + ((size_t) kvh * n_chunks * G + hl) * HD + d;  // chunk c at pa[c * G * HD]
+    float M = -FLT_MAX;
+    int c = 0;
+    for (; c + U <= active_chunks; c += U) {
+        float mm[U];
+#pragma unroll
+        for (int j = 0; j < U; ++j) mm[j] = pm[(size_t) (c + j) * G];
+#pragma unroll
+        for (int j = 0; j < U; ++j) M = fmaxf(M, mm[j]);
+    }
+    for (; c < active_chunks; ++c) M = fmaxf(M, pm[(size_t) c * G]);
+    float L = 0.0f, acc = 0.0f;
+    c = 0;
+    for (; c + U <= active_chunks; c += U) {
+        float mm[U], ll[U], aa[U];
+#pragma unroll
+        for (int j = 0; j < U; ++j) {
+            mm[j] = pm[(size_t) (c + j) * G];
+            ll[j] = pl[(size_t) (c + j) * G];
+            aa[j] = pa[(size_t) (c + j) * G * HD];
+        }
+#pragma unroll
+        for (int j = 0; j < U; ++j) {
+            if (mm[j] == -FLT_MAX) continue;
+            const float w = __expf(mm[j] - M);
+            L = fmaf(ll[j], w, L);
+            acc = fmaf(aa[j], w, acc);
+        }
+    }
+    for (; c < active_chunks; ++c) {
+        const float m = pm[(size_t) c * G];
+        if (m == -FLT_MAX) continue;
+        const float w = __expf(m - M);
+        L = fmaf(pl[(size_t) c * G], w, L);
+        acc = fmaf(pa[(size_t) c * G * HD], w, acc);
+    }
+    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
+// GUILD_ATTN_TUNED=0: the serial merge and the untuned pre75 chunk kernel (same bits; for A/B timing)
+bool attn_tuned() {
+    static const bool tuned = [] {
+        const char* e = std::getenv("GUILD_ATTN_TUNED");
+        return e == nullptr || e[0] != '0';
+    }();
+    return tuned;
+}
+
+template <int G>
+void launch_attn_merge(int n_head, int n_q, cudaStream_t st, const float* part_acc, const float* part_m,
+                       const float* part_l, const int32_t* steps, int n_chunks, float* attn, long long stride) {
+    if (!attn_tuned())
+        attn_merge_kernel_serial<G><<<dim3((unsigned) n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l,
+                                                                                            steps, n_chunks, attn, stride);
+    else
+        attn_merge_kernel<G><<<dim3((unsigned) (n_head * MERGE_SPLIT), (unsigned) n_q), HD / MERGE_SPLIT, 0, st>>>(
+            part_acc, part_m, part_l, steps, n_chunks, attn, stride);
 }
 
 #if defined(GUILD_EXPERIMENTAL_SM60)
@@ -475,7 +592,11 @@ void launch_attn_chunk_batch(const dim3& grid, cudaStream_t st,
                              int n_chunks, int cap, long long stride) {
     if constexpr (G == 8 || G == 12) {
         if (pre75_attn()) {
-            attn_chunk_kernel_pre75<G, M><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, n_kv_heads, page_size, scale, part_acc, part_m, part_l, n_chunks, cap, stride);
+            constexpr bool tuned = G == 12;   // G = 8: the untuned kernel (see attn_chunk_kernel_pre75)
+            if (tuned && attn_tuned())
+                attn_chunk_kernel_pre75<G, M, tuned><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, n_kv_heads, page_size, scale, part_acc, part_m, part_l, n_chunks, cap, stride);
+            else
+                attn_chunk_kernel_pre75<G, M, false><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, n_kv_heads, page_size, scale, part_acc, part_m, part_l, n_chunks, cap, stride);
             return;
         }
     }
@@ -488,7 +609,11 @@ void launch_attn_chunk_step(const dim3& grid, cudaStream_t st,
                             int n_chunks) {
     if constexpr (G == 8 || G == 12) {
         if (pre75_attn()) {
-            attn_chunk_kernel_pre75<G, M><<<grid, THREADS, 0, st>>>(q, pools, ids, step, n_kv_heads, page_size, scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+            constexpr bool tuned = G == 12;   // G = 8: the untuned kernel (see attn_chunk_kernel_pre75)
+            if (tuned && attn_tuned())
+                attn_chunk_kernel_pre75<G, M, tuned><<<grid, THREADS, 0, st>>>(q, pools, ids, step, n_kv_heads, page_size, scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+            else
+                attn_chunk_kernel_pre75<G, M, false><<<grid, THREADS, 0, st>>>(q, pools, ids, step, n_kv_heads, page_size, scale, part_acc, part_m, part_l, n_chunks, 0, 0);
             return;
         }
     }
@@ -571,7 +696,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 #define DISPATCH_BATCH(GV) \
     case GV: \
         dispatch_attn_chunk_batch<GV>(kv_mode, grid, st, q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, actual_id_stride, stride); \
-        attn_merge_kernel<GV><<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, steps, n_chunks, attn, stride); \
+        launch_attn_merge<GV>((int) s.n_head, (int) n_q, st, part_acc, part_m, part_l, steps, n_chunks, attn, stride); \
         break;
 
     switch (G_val) {
@@ -623,7 +748,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 #define DISPATCH_STEP(GV) \
     case GV: \
         dispatch_attn_chunk_step<GV>(kv_mode, grid, st, q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks); \
-        attn_merge_kernel<GV><<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, step, n_chunks, attn); \
+        launch_attn_merge<GV>((int) s.n_head, 1, st, part_acc, part_m, part_l, step, n_chunks, attn, 0); \
         break;
 
     switch (G_val) {
