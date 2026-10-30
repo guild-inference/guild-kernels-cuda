@@ -945,6 +945,270 @@ __global__ void __launch_bounds__(THREADS) gr_up_cols_kernel(GrMulti m) {
     }
 }
 
+// gr_up_cols_kernel with the next column's loads unconditional: the last column clamps to column N - 1 (its values
+// unused) and a lane whose token j >= T loads token 0's inputs, so no branch guards the loads.  The arithmetic is
+// gr_up_cols_kernel's.  (ptxas still issues the next column's weight loads after this column's dot products, reusing
+// their registers.  Issuing them first - plain loads held in place by a __syncwarp, which also fit the two-token
+// kernel in 79 registers, three blocks an SM - measured no faster on a GTX 1070: 37.8 us against 37.3 at two tokens,
+// 35.8 against 35.6 at one.)
+template <int T>
+__global__ void __launch_bounds__(THREADS) gr_up_cols2_kernel(GrMulti m) {
+    __shared__ __align__(16) float4 lo4[T][2][LR / 8];
+    const int t = threadIdx.x, lane = t & 31, j = lane & 7, c = lane >> 3;
+    const int gw = blockIdx.x * WARPS + (t >> 5), nw = gridDim.x * WARPS;
+    const int jt = j < T ? j : 0;
+    const bool apply = j < T && m.a[jt].apply;   // token j's pending write, on the lanes j < T
+    const float gwc = apply ? 2.0f * sigmoidf_(m.a[jt].inj_prev[c] / (float) HC) : 0.0f;
+    const float rsc = j < T ? m.a[jt].rs[c] : 0.0f;
+    const float* Rj = m.a[jt].R;
+    const float* Nj = m.a[jt].w_norm;
+    const float* Bj = m.a[jt].apply ? m.a[jt].bo_prev : m.a[jt].R;   // any valid address when there is no write
+    const uint16_t* wup = m.a[0].w_up;
+    uint4 w[5];
+    float rv, wn, bo;
+    auto load = [&](int d, uint4(&wd)[5], float& r_, float& n_, float& b_) {
+        const int i = c * N + d;
+        const uint4* w4 = reinterpret_cast<const uint4*>(wup + (size_t) i * LR);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) wd[q] = __ldg(w4 + j + 8 * q);
+        wd[4] = __ldg(w4 + 32 + j);
+        r_ = Rj[i];
+        n_ = Nj[i];
+        b_ = Bj[d];
+    };
+    int d = gw;
+    load(d < N ? d : N - 1, w, rv, wn, bo);
+    for (int e = t; e < T * LR; e += THREADS) {
+        const int k = e / LR, f = e - k * LR;
+        reinterpret_cast<float*>(&lo4[k][(f & 7) >> 2][f >> 3])[f & 3] = m.a[k].lo[f];
+    }
+    __syncthreads();
+    for (; d < N; d += nw) {
+        uint4 wn_next[5];
+        float rv_next, wnorm_next, bo_next;
+        load(d + nw < N ? d + nw : N - 1, wn_next, rv_next, wnorm_next, bo_next);
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float p0 = dot8v(w[0], lo4[k][0][j], lo4[k][1][j]) + dot8v(w[4], lo4[k][0][32 + j], lo4[k][1][32 + j]);
+            const float p1 = dot8v(w[1], lo4[k][0][j + 8], lo4[k][1][j + 8]);
+            const float p2 = dot8v(w[2], lo4[k][0][j + 16], lo4[k][1][j + 16]);
+            const float p3 = dot8v(w[3], lo4[k][0][j + 24], lo4[k][1][j + 24]);
+            float s = (p0 + p2) + (p1 + p3);
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            if (j == k) mine = s;
+        }
+        float gv = 0.0f;   // lane (c, j < T): token j's g of stream c
+        if (j < T) {
+            float x0 = rv;
+            if (apply) {
+                x0 = fmaf(bo, gwc, x0);
+                m.a[j].R_out[c * N + d] = x0;
+            }
+            const float x = x0 * wn * rsc;
+            gv = x * sigmoidf_(mine);
+        }
+        const float g1 = __shfl_sync(0xffffffffu, gv, j + 8), g2 = __shfl_sync(0xffffffffu, gv, j + 16),
+                    g3 = __shfl_sync(0xffffffffu, gv, j + 24);
+        if (c == 0 && j < T) {
+            float s = 0.0f;
+            s += gv;
+            s += g1;
+            s += g2;
+            s += g3;
+            m.a[j].mixed[d] = s / (float) HC;
+        }
+#pragma unroll
+        for (int q = 0; q < 5; ++q) w[q] = wn_next[q];
+        rv = rv_next;
+        wn = wnorm_next;
+        bo = bo_next;
+    }
+}
+
+// gr_down_direct_kernel with each ring slot refilled after its chunk is used (the loaded register is then the slot's
+// own: no copies at the end of a round, which made the warp wait for nearly every load in flight) and the
+// activations XA chunks ahead.  The lane's chunk order and every sum are gr_down_direct_kernel's.
+template <int T, int RING = DD_RING, int XA = 3>
+__global__ void __launch_bounds__(DD_WARPS * 32) gr_down_lac_kernel(GrMulti m) {
+    constexpr int Q = D / 8 / 32;
+    constexpr int XS = XA + 1;
+    static_assert(Q % RING == 0 && RING % XS == 0, "whole rounds of the ring and of the activation slots");
+    const int lane = threadIdx.x & 31, warp = blockIdx.x * DD_WARPS + (threadIdx.x >> 5);
+    const int nrows = LR + (m.a[0].w_inject != nullptr ? HC : 0);
+    const int g0 = warp * DD_ROWS;
+    if (g0 >= nrows) return;
+    const uint4* w4[DD_ROWS];
+#pragma unroll
+    for (int r = 0; r < DD_ROWS; ++r) {
+        const int g = g0 + r < nrows ? g0 + r : nrows - 1;
+        w4[r] = reinterpret_cast<const uint4*>(g < LR ? m.a[0].w_down + (size_t) g * D
+                                                      : m.a[0].w_inject + (size_t) (g - LR) * D) + lane;
+    }
+    const float4* x4 = reinterpret_cast<const float4*>(m.xn) + 2 * lane;
+    uint4 ring[RING][DD_ROWS];
+#pragma unroll
+    for (int p = 0; p < RING; ++p)
+#pragma unroll
+        for (int r = 0; r < DD_ROWS; ++r) ring[p][r] = __ldg(w4[r] + 32 * p);
+    float4 xa[XS][T], xb[XS][T];   // chunk q's activations in slot q % XS
+#pragma unroll
+    for (int s = 0; s < XA; ++s)
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            xa[s][k] = __ldg(x4 + (size_t) k * (D / 4) + 64 * s);
+            xb[s][k] = __ldg(x4 + (size_t) k * (D / 4) + 64 * s + 1);
+        }
+    float acc[DD_ROWS][T];
+#pragma unroll
+    for (int r = 0; r < DD_ROWS; ++r)
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[r][k] = 0.0f;
+    // chunk q from ring slot p and activation slot sx; read chunk q + XA's activations into slot sn, then refill
+    // slot p with chunk q + RING
+    auto step = [&](int q, int p, int sx, int sn, bool pf_w, bool pf_x) {
+        if (pf_x) {
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                xa[sn][k] = __ldg(x4 + (size_t) k * (D / 4) + 64 * (q + XA));
+                xb[sn][k] = __ldg(x4 + (size_t) k * (D / 4) + 64 * (q + XA) + 1);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < DD_ROWS; ++r)
+#pragma unroll
+            for (int k = 0; k < T; ++k) acc[r][k] += dot8v(ring[p][r], xa[sx][k], xb[sx][k]);
+        if (pf_w) {
+#pragma unroll
+            for (int r = 0; r < DD_ROWS; ++r) ring[p][r] = __ldg(w4[r] + 32 * (q + RING));
+        }
+    };
+#pragma unroll 1
+    for (int q0 = 0; q0 < Q - RING; q0 += RING) {
+#pragma unroll
+        for (int p = 0; p < RING; ++p) step(q0 + p, p, p % XS, (p + XA) % XS, true, true);
+    }
+#pragma unroll
+    for (int p = 0; p < RING; ++p) step(Q - RING + p, p, p % XS, (p + XA) % XS, false, p + XA < RING);
+#pragma unroll
+    for (int r = 0; r < DD_ROWS; ++r) {
+        const int g = g0 + r;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float s = warp_sum(acc[r][k]);
+            if (lane != k || g >= nrows) continue;
+            if (g >= LR) {
+                m.a[k].inject_out[g - LR] = s;
+            } else {
+                const float x = s / (float) HC;
+                m.a[k].lo[g] = x / (1.0f + __expf(-x));
+            }
+        }
+    }
+}
+
+// ---- The one- and two-token read, second version (GUILD_HC_V2, a bit mask, default 23; 0 = the kernels above):
+// bit 0: the norm in one pass (gr_norm_pf_kernel), with the head of every w_down / w_inject row prefetched into L2
+//        while it runs (GUILD_HC_PF bytes a row, default 4096; 0 = no prefetch);
+// bit 1: the column up kernel with its next column's loads unconditional (gr_up_cols2_kernel);
+// bit 2: the direct down kernel refilling a ring slot after its chunk is used (gr_down_lac_kernel);
+// bit 4 (with bit 0): the norm's prefetch by blocks of their own (grid y = HC .. HC + 3).
+// Each computes every output with the operations, order and roundings of the kernel it replaces.  In the engine on a
+// GTX 1070 (nsys, the Qwen decode at 32K with MTP, medians at one / two tokens): norm 7.30 / 7.36 us -> 4.70 / 5.12,
+// down 36.03 / 40.07 -> 34.18 / 37.95, up 35.52 / 39.52 -> 35.17 / 38.37; the decode window 65.56 -> 64.93 ms (prose,
+// 2.13 tokens a window) and 68.59 -> 67.99 ms (code, 3.05).
+
+// gr_norm_split_kernel in one pass: a thread's float4 of stream c (i = 4t + 1024k, k ascending: two or three) are
+// loaded at once and held in registers, so the second pass over R, bo_prev and w_norm is gone; the sums of squares,
+// the warp and block reductions, rs and the two roundings of xn are the split kernel's.  The norm runs on 4 or 8
+// blocks and mostly waits on its loads, the card's DRAM idle; meanwhile `pf_lines` 128-byte lines at the head of
+// every row of w_down and w_inject are prefetched into L2 (CCTL.E.PF2), so the down kernel that follows finds its
+// first loads there.  Blocks with blockIdx.y >= HC only prefetch; without them (gridDim.y == HC) the norm's own
+// threads do, after their loads.
+__global__ void __launch_bounds__(THREADS) gr_norm_pf_kernel(GrMulti m, int pf_lines) {
+    __shared__ float part[WARPS];
+    __shared__ float s_rs;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    if (blockIdx.y >= HC) {   // a prefetch-only block (grid y beyond the streams): the lines of the rows' heads
+        const FusedGrArgs& a0 = m.a[0];
+        const int nthr = gridDim.x * (gridDim.y - HC) * THREADS;
+        const int nrows = LR + (a0.w_inject != nullptr ? HC : 0);
+        for (int L = ((blockIdx.y - HC) * gridDim.x + blockIdx.x) * THREADS + t; L < nrows * pf_lines; L += nthr) {
+            const int row = L / pf_lines, off = L - row * pf_lines;
+            const uint16_t* p =
+                (row < LR ? a0.w_down + (size_t) row * D : a0.w_inject + (size_t) (row - LR) * D) + off * 64;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+        }
+        return;
+    }
+    const FusedGrArgs& a = m.a[blockIdx.x];
+    const int c = blockIdx.y;
+    float* xn = m.xn + (size_t) blockIdx.x * D;
+    constexpr int STRIDE = THREADS * 4;
+    const int first = c * N - t * 4;                    // the first k with 4t + 1024k >= c*N
+    const int i0 = t * 4 + (first > 0 ? (first + STRIDE - 1) / STRIDE : 0) * STRIDE;
+    const int lim = (c + 1) * N;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    float4 r[3], g[3];
+#pragma unroll
+    for (int q = 0; q < 3; ++q) {
+        const int i = i0 + q * STRIDE;
+        if (i < lim) {
+            r[q] = *reinterpret_cast<const float4*>(a.R + i);
+            g[q] = *reinterpret_cast<const float4*>(a.w_norm + i);
+        }
+    }
+    if (a.apply) {
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            const int i = i0 + q * STRIDE;
+            if (i < lim) {
+                const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + (i - c * N));
+                r[q].x = fmaf(b.x, gw, r[q].x); r[q].y = fmaf(b.y, gw, r[q].y);
+                r[q].z = fmaf(b.z, gw, r[q].z); r[q].w = fmaf(b.w, gw, r[q].w);
+            }
+        }
+    }
+    if (pf_lines > 0 && gridDim.y == HC) {   // no prefetch-only blocks: the norm blocks prefetch
+        const int nthr = gridDim.x * gridDim.y * THREADS;
+        const int nrows = LR + (a.w_inject != nullptr ? HC : 0);
+        for (int L = (blockIdx.y * gridDim.x + blockIdx.x) * THREADS + t; L < nrows * pf_lines; L += nthr) {
+            const int row = L / pf_lines, off = L - row * pf_lines;
+            const uint16_t* p =
+                (row < LR ? a.w_down + (size_t) row * D : a.w_inject + (size_t) (row - LR) * D) + off * 64;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+        }
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 3; ++q) {
+        if (i0 + q * STRIDE < lim) {
+            const float sq = r[q].x * r[q].x + r[q].y * r[q].y + r[q].z * r[q].z + r[q].w * r[q].w;
+            ss += sq;
+        }
+    }
+    const float v = warp_sum(ss);
+    if (lane == 0) part[warp] = v;
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < WARPS; ++w) s += part[w];
+        s_rs = rsqrtf(s / (float) N + a.eps);
+        a.rs[c] = s_rs;
+    }
+    __syncthreads();
+    const float rs = s_rs;
+#pragma unroll
+    for (int q = 0; q < 3; ++q) {
+        const int i = i0 + q * STRIDE;
+        if (i < lim) {
+            const float px = r[q].x * g[q].x, py = r[q].y * g[q].y, pz = r[q].z * g[q].z, pw = r[q].w * g[q].w;
+            *reinterpret_cast<float4*>(xn + i) = make_float4(px * rs, py * rs, pz * rs, pw * rs);
+        }
+    }
+}
+
 bool hc_direct() {
     static const bool on = [] {
         const char* v = std::getenv("GUILD_HC_DIRECT");
@@ -953,24 +1217,46 @@ bool hc_direct() {
     return on;
 }
 
-// gr_up_cols_kernel<T>'s grid on the current card: as many blocks as fit at once (cached per device)
-int up_cols_blocks(int T) {
-    static int blocks[64][2] = {};
+/// GUILD_HC_V2 (bit mask, default 23) and GUILD_HC_PF (bytes a row, default 4096): see gr_norm_pf_kernel above
+int hc_v2() {
+    static const int v = [] {
+        const char* e = std::getenv("GUILD_HC_V2");
+        return e != nullptr ? std::atoi(e) : 23;
+    }();
+    return v;
+}
+int hc_pf_lines() {
+    static const int v = [] {
+        const char* e = std::getenv("GUILD_HC_PF");
+        const int bytes = e != nullptr ? std::atoi(e) : 4096;
+        return bytes > 0 ? (bytes + 127) / 128 : 0;
+    }();
+    return v;
+}
+
+// an up kernel's grid on the current card: as many blocks as fit at once (cached per device and kernel slot)
+template <typename K>
+int up_blocks(K kernel, int slot) {
+    static int blocks[64][8] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
         cudaGetLastError();
         return 30;
     }
-    int& b = blocks[dev][T - 1];
+    int& b = blocks[dev][slot];
     if (b == 0) {
         int sms = 0, per_sm = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        if (T == 1) cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gr_up_cols_kernel<1>, THREADS, 0);
-        else cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gr_up_cols_kernel<2>, THREADS, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, THREADS, 0);
         cudaGetLastError();
         b = (sms > 0 ? sms : 15) * (per_sm > 0 ? per_sm : 1);
     }
     return b;
+}
+// launch an up kernel on its full grid; slots: (kernel version) * 2 + T - 1
+template <typename K>
+void launch_up(K kernel, int slot, const GrMulti& m, cudaStream_t st) {
+    kernel<<<up_blocks(kernel, slot), THREADS, 0, st>>>(m);
 }
 #endif
 
@@ -1068,6 +1354,14 @@ namespace {
 #endif
 void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
+    const bool staged = variant >= kHcStaged;
+    int tv = 2560, st_tile = H_TILE;
+    const int chunk_tok = down_chunk(staged, &tv, &st_tile);
+    const bool p_tile = staged && st_tile == P_TILE;
+#if !defined(__HIPCC__)
+    const bool direct = p_tile && n_tok <= 2 && hc_direct();   // one or two tokens before sm_70
+    const int v2 = direct ? hc_v2() : 0;
+#endif
 #if defined(GUILD_HIP_GFX906)
     // gfx906: the latency-hidden norm/up (GUILD_GR_FAST=0: off) - the same sums in the same order as the kernels
     // they replace (gr_parity checks the multi-token read against single-token calls bitwise)
@@ -1075,22 +1369,37 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     if (variant >= kHcSplit) gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
     else if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
     else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+#elif !defined(__HIPCC__)
+    if (v2 & 1) {   // the one-pass norm; with bit 4 its prefetch runs on 4 more rows of blocks
+        const int pf = hc_pf_lines(), extra = pf > 0 && (v2 & 16) ? 4 : 0;
+        gr_norm_pf_kernel<<<dim3((unsigned) n_tok, HC + extra), THREADS, 0, st>>>(m, pf);
+    } else if (variant >= kHcSplit) {
+        gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+    } else {
+        gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+    }
 #else
     if (variant >= kHcSplit) gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
     else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
 #endif
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
-    const bool staged = variant >= kHcStaged;
-    int tv = 2560, st_tile = H_TILE;
-    const int chunk_tok = down_chunk(staged, &tv, &st_tile);
-    const bool p_tile = staged && st_tile == P_TILE;
 #if !defined(__HIPCC__)
-    if (p_tile && n_tok <= 2 && hc_direct()) {   // one or two tokens before sm_70: the direct down, the column up
-        if (n_tok == 1) gr_down_direct_kernel<1><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
-        else gr_down_direct_kernel<2><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+    if (direct) {   // the direct down, the column up
+        if (v2 & 4) {
+            if (n_tok == 1) gr_down_lac_kernel<1><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+            else gr_down_lac_kernel<2><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+        } else {
+            if (n_tok == 1) gr_down_direct_kernel<1><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+            else gr_down_direct_kernel<2><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+        }
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
-        if (n_tok == 1) gr_up_cols_kernel<1><<<up_cols_blocks(1), THREADS, 0, st>>>(m);
-        else gr_up_cols_kernel<2><<<up_cols_blocks(2), THREADS, 0, st>>>(m);
+        if (v2 & 2) {
+            if (n_tok == 1) launch_up(gr_up_cols2_kernel<1>, 2, m, st);
+            else launch_up(gr_up_cols2_kernel<2>, 3, m, st);
+        } else {
+            if (n_tok == 1) launch_up(gr_up_cols_kernel<1>, 0, m, st);
+            else launch_up(gr_up_cols_kernel<2>, 1, m, st);
+        }
         return;
     }
 #endif
