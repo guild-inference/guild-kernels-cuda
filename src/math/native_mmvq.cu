@@ -1393,6 +1393,34 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     }
 }
 
+// tmp[j][i] += row i's block (wv[i]) . column j's activations at x + j * x_stride, for the rows i < nr and the
+// columns j < nc.  For traits with load_x/dot a column's activations are loaded once for every row (F::apply is
+// F::dot(wv, F::load_x(...))): each tmp[j][i] gets the same += either way.
+template<typename F, int ROWS, int TILE>
+__device__ __forceinline__ void acc_tile(float (&tmp)[TILE][ROWS], const typename F::W (&wv)[ROWS],
+                                         const Q81Block* __restrict__ x, int x_stride, int kqs, int nr, int nc) {
+    if constexpr (has_split_x<F>::value && ROWS > 1) {
+#pragma unroll
+        for (int j = 0; j < TILE; ++j) {
+            if (j < nc) {
+                const typename F::X xv = F::load_x(x + std::size_t(j) * x_stride, kqs);
+#pragma unroll
+                for (int i = 0; i < ROWS; ++i)
+                    if (i < nr) tmp[j][i] += F::dot(wv[i], xv);
+            }
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (i < nr) {
+#pragma unroll
+                for (int j = 0; j < TILE; ++j)
+                    if (j < nc) tmp[j][i] += F::apply(wv[i], x + std::size_t(j) * x_stride, kqs);
+            }
+        }
+    }
+}
+
 template<typename F, int NW, int ROWS, int MAX_IT>
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_many_reg_kernel(const typename F::Block* __restrict__ w,
@@ -1427,41 +1455,16 @@ __global__ void native_mmvq_many_reg_kernel(const typename F::Block* __restrict_
     for (int c0 = 0; c0 < ncols; c0 += TILE, buf ^= 1) {
         const int nc = min(TILE, ncols - c0);
         float tmp[TILE][ROWS] = {};
-        if (nc == TILE) {
+        const int nr = min(ROWS, n_out - row0);
 #pragma unroll
-            for (int it = 0; it < MAX_IT; ++it) {
-                const int kbx = kbx0 + it * BPI;
-                if (kbx < blocks_per_row) {
-                    const int kby = kbx * F::KBY;
-#pragma unroll
-                    for (int i = 0; i < ROWS; ++i) {
-                        if (row0 + i < n_out) {
-#pragma unroll
-                            for (int j = 0; j < TILE; ++j) {
-                                tmp[j][i] += F::apply(wv[it][i], x + std::size_t(c0 + j) * x_stride + kby, kqs);
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-#pragma unroll
-            for (int it = 0; it < MAX_IT; ++it) {
-                const int kbx = kbx0 + it * BPI;
-                if (kbx < blocks_per_row) {
-                    const int kby = kbx * F::KBY;
-#pragma unroll
-                    for (int i = 0; i < ROWS; ++i) {
-                        if (row0 + i < n_out) {
-#pragma unroll
-                            for (int j = 0; j < TILE; ++j) {
-                                if (j < nc) {
-                                    tmp[j][i] += F::apply(wv[it][i], x + std::size_t(c0 + j) * x_stride + kby, kqs);
-                                }
-                            }
-                        }
-                    }
-                }
+        for (int it = 0; it < MAX_IT; ++it) {
+            const int kbx = kbx0 + it * BPI;
+            if (kbx < blocks_per_row) {
+                const int kby = kbx * F::KBY;
+                if (nc == TILE)
+                    acc_tile<F, ROWS, TILE>(tmp, wv[it], x + std::size_t(c0) * x_stride + kby, x_stride, kqs, nr, TILE);
+                else
+                    acc_tile<F, ROWS, TILE>(tmp, wv[it], x + std::size_t(c0) * x_stride + kby, x_stride, kqs, nr, nc);
             }
         }
 #pragma unroll
@@ -1520,21 +1523,14 @@ __global__ void native_mmvq_many_loop_kernel(const typename F::Block* __restrict
     for (int c0 = 0; c0 < ncols; c0 += TILE, buf ^= 1) {
         const int nc = min(TILE, ncols - c0);
         float tmp[TILE][ROWS] = {};
+        const int nr = min(ROWS, n_out - row0);
         for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
             const int kby = kbx * F::KBY;
+            typename F::W wv[ROWS];
 #pragma unroll
-            for (int i = 0; i < ROWS; ++i) {
-                if (row0 + i < n_out) {
-                    const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
-                    const typename F::W wv = F::load(w + block, kqs);
-#pragma unroll
-                    for (int j = 0; j < TILE; ++j) {
-                        if (j < nc) {
-                            tmp[j][i] += F::apply(wv, x + std::size_t(c0 + j) * x_stride + kby, kqs);
-                        }
-                    }
-                }
-            }
+            for (int i = 0; i < ROWS; ++i)
+                if (i < nr) wv[i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+            acc_tile<F, ROWS, TILE>(tmp, wv, x + std::size_t(c0) * x_stride + kby, x_stride, kqs, nr, nc);
         }
 #pragma unroll
         for (int j = 0; j < TILE; ++j) {
@@ -1600,7 +1596,11 @@ void launch_many(const void* weights, const void* x_q8_1, float* y, int n_in, in
         launch_many_rows<F, 2, 2>(w, x, y, n_in, n_out, ncols, s);
         return;
     }
-    if (n_in / F::DIV < F::BPI) {
+    // Two rows a block where the format loads a column's activations apart (acc_tile: once for both rows): a
+    // prompt's 128 columns on a GTX 1070, one row -> two (us, the same bits): Q8_0 2048 -> 8192 3352 -> 2398,
+    // 4096 -> 2048 1636 -> 1110; Q4_K 2048 -> 8192 3148 -> 2248, 4096 -> 2048 1952 -> 1297; Q6_K 2048 -> 8192
+    // 3321 -> 2702.  Four rows were slower on every one.
+    if (has_split_x<F>::value || n_in / F::DIV < F::BPI) {
         launch_many_rows<F, WARPS, 2>(w, x, y, n_in, n_out, ncols, s);
     } else {
         launch_many_rows<F, WARPS, 1>(w, x, y, n_in, n_out, ncols, s);
