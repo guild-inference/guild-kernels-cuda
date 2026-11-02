@@ -1114,6 +1114,9 @@ __global__ void __launch_bounds__(DD_WARPS * 32) gr_down_lac_kernel(GrMulti m) {
 //        while it runs (GUILD_HC_PF bytes a row, default 4096, at most a row's 20480; 0 = no prefetch);
 // bit 1: the column up kernel with its next column's loads unconditional (gr_up_cols2_kernel);
 // bit 2: the direct down kernel refilling a ring slot after its chunk is used (gr_down_lac_kernel);
+// bit 3 (with bits 1 and 2): three and four tokens through the direct down and column up kernels too, the down
+//        kernel one chunk of activations ahead instead of three (a window read as one group, Guild's
+//        --defer-experts, sends up to four; before, they took the staged down and the planes up);
 // bit 4 (with bit 0): the norm's prefetch by blocks of their own (grid y = HC .. HC + 3).
 // Each computes every output with the operations, order and roundings of the kernel it replaces.  In the engine on a
 // GTX 1070 (nsys, the Qwen decode at 32K with MTP, medians at one / two tokens): norm 7.30 / 7.36 us -> 4.70 / 5.12,
@@ -1218,11 +1221,11 @@ bool hc_direct() {
     return on;
 }
 
-/// GUILD_HC_V2 (bit mask, default 23) and GUILD_HC_PF (bytes a row, default 4096): see gr_norm_pf_kernel above
+/// GUILD_HC_V2 (bit mask, default 31) and GUILD_HC_PF (bytes a row, default 4096): see gr_norm_pf_kernel above
 int hc_v2() {
     static const int v = [] {
         const char* e = std::getenv("GUILD_HC_V2");
-        return e != nullptr ? std::atoi(e) : 23;
+        return e != nullptr ? std::atoi(e) : 31;
     }();
     return v;
 }
@@ -1364,7 +1367,9 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     const int chunk_tok = down_chunk(staged, &tv, &st_tile);
     const bool p_tile = staged && st_tile == P_TILE;
 #if !defined(__HIPCC__)
-    const bool direct = p_tile && n_tok <= 2 && hc_direct();   // one or two tokens before sm_70
+    // one or two tokens before sm_70; three and four with GUILD_HC_V2's bit 3 (default on): a window read as one
+    // group (--defer-experts) sends up to four
+    const bool direct = p_tile && hc_direct() && (n_tok <= 2 || (n_tok <= 4 && (hc_v2() & 14) == 14));
     const int v2 = direct ? hc_v2() : 0;
 #endif
 #if defined(GUILD_HIP_GFX906)
@@ -1391,8 +1396,11 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
 #if !defined(__HIPCC__)
     if (direct) {   // the direct down, the column up
         if (v2 & 4) {
+            // three and four tokens: one chunk of activations ahead, not three (registers)
             if (n_tok == 1) gr_down_lac_kernel<1><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
-            else gr_down_lac_kernel<2><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+            else if (n_tok == 2) gr_down_lac_kernel<2><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+            else if (n_tok == 3) gr_down_lac_kernel<3, DD_RING, 1><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
+            else gr_down_lac_kernel<4, DD_RING, 1><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
         } else {
             if (n_tok == 1) gr_down_direct_kernel<1><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
             else gr_down_direct_kernel<2><<<DD_BLOCKS, DD_WARPS * 32, 0, st>>>(m);
@@ -1400,7 +1408,9 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
         if (v2 & 2) {
             if (n_tok == 1) launch_up(gr_up_cols2_kernel<1>, 2, m, st);
-            else launch_up(gr_up_cols2_kernel<2>, 3, m, st);
+            else if (n_tok == 2) launch_up(gr_up_cols2_kernel<2>, 3, m, st);
+            else if (n_tok == 3) launch_up(gr_up_cols2_kernel<3>, 4, m, st);
+            else launch_up(gr_up_cols2_kernel<4>, 5, m, st);
         } else {
             if (n_tok == 1) launch_up(gr_up_cols_kernel<1>, 0, m, st);
             else launch_up(gr_up_cols_kernel<2>, 1, m, st);
