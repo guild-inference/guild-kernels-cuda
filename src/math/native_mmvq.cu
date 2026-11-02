@@ -1648,6 +1648,8 @@ bool g_staged_off = std::getenv("GUILD_MMVQ_STAGED") && std::string(std::getenv(
 // and 181 -> 193 GB/s; not Q8_0's sums, too short for it (202 -> 169 at three columns), nor Q4_K's, where the
 // compiler's choices made three columns 127 -> 133 in one build and -> 121 in the next.
 template<typename F> struct Staged { static constexpr int C = 0; }; // the other formats: not staged
+// the rolled loop's threshold on the chunked path (rows of more than ROWC blocks): ROLL unless a format says otherwise
+template<typename F> struct RollChunked { static constexpr int v = Staged<F>::ROLL; };
 //
 // XREC, put, get: the activations as the format's loads read them, written once per block when the columns are copied
 // in, so a lane takes its ints and its scale in one 8- or 16-byte load instead of three to six 4-byte ones.  The same
@@ -1719,6 +1721,12 @@ template<> struct Staged<Q6KTraits> {                                           
         return float(r.d) * sumf;
     }
 };
+// Q6_K's rows of more than 12 blocks (Qwen3.8-Flash-Next's ssm_out, 24 blocks; attn_output, 16), its four sums
+// unrolled up to 8 columns: at two columns ssm_out 84.9 -> 75.7 us and attn_output 57.4 -> 49.5 on a GTX 1070
+// (glm5_kernels_test shapes), three and four columns faster too.  The rolled loop pays where these rows were staged
+// as 8 + 2 blocks (the heads, now one chunk a row: ROWC).  (One chunk a row up to 24 blocks instead, ROWC = 24, made
+// every one-chunk kernel's two columns 1.6x slower: their staging registers.)
+template<> struct RollChunked<Q6KTraits> { static constexpr int v = 9; };
 template<> struct Staged<SmallTraits<Q80Block, 8>> {                                            // 1088 bytes
     static constexpr int C = 32, MAX_COLS = 4, ROLL = 9, ROWC = 0, XREC = 0;
 };
@@ -1728,6 +1736,7 @@ __host__ __device__ constexpr int staged_xcol(int n_in) {
     return XR ? (n_in / Q8K) * Staged<F>::XREC : (n_in / Q8K) * int(sizeof(Q81Block));
 }
 constexpr int STAGED_NW = 8; // warps a block
+
 
 // the bytes of shared memory a warp stages a chunk in: its 16-byte pieces, and one more where the row starts inside
 // a piece.  A kernel whose rows are one chunk each (C > Staged<F>::C) takes only the row's.
@@ -1896,7 +1905,7 @@ __global__ void native_mmvq_staged_kernel(const uint8_t* __restrict__ w, const Q
                 const float v = warp_sum(tot[j]);
                 if (lane == 0) y[std::size_t(j) * n_out + r] = v;
             }
-        } else if constexpr (NCOLS >= Staged<F>::ROLL) {
+        } else if constexpr (NCOLS >= RollChunked<F>::v) {
 #pragma unroll 1
             for (int t = 0; t < WARPS; ++t) {
                 step(t, 0);
