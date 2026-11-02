@@ -114,8 +114,11 @@ bool supported(int t) {
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
+#if defined(GUILD_MMQ_KQUANTS) || defined(GUILD_MMQ_K45)
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:   // UD-Q4_K_XL experts; GLM-5.3-Flash's --dense q4_k / q5_k
+#endif
 #ifdef GUILD_MMQ_KQUANTS
-        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
+        case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
 #endif
 #ifdef GUILD_MMQ_Q6K
         case GGML_TYPE_Q6_K:   // GLM-5.3-Flash's attention matrices re-quantized to Q6_K (Guild's src/core/glm5.cpp)
@@ -203,9 +206,11 @@ void Context::run(const Product& p, void* stream) {
 #ifdef GUILD_MMQ_Q6K
         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
 #endif
-#ifdef GUILD_MMQ_KQUANTS
+#if defined(GUILD_MMQ_KQUANTS) || defined(GUILD_MMQ_K45)
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+#endif
+#ifdef GUILD_MMQ_KQUANTS
         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
 #endif
         default:

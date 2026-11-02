@@ -1691,6 +1691,25 @@ template<> struct Staged<Q4KTraits> {                                           
         return v;
     }
 };
+// Q5_K: Q4_K's activation slots (the same ints and scale a thread reads), its blocks 176 bytes, so a row stays
+// 16-byte aligned.  Its own kernel reads each int with a load: 163 against 214 GB/s for GLM-5.3-Flash's 4096 x 24576
+// at one column on a GTX 1070 (glm5_kernels_test shapes).
+template<> struct Staged<Q5KTraits> {                                                           // 1408 bytes
+    static constexpr int C = 8, MAX_COLS = 3, ROLL = 9, ROWC = 0;
+    static constexpr int XREC = Staged<Q4KTraits>::XREC, XSLOTS = Staged<Q4KTraits>::XSLOTS;
+    __device__ static void put(uint8_t* rec, const Q81Block* __restrict__ b, int s) {
+        Staged<Q4KTraits>::put(rec, b, s);
+    }
+    __device__ static Q5KTraits::X get(const uint8_t* xs, int kbx, int iqs) {
+        const Q4KTraits::X v = Staged<Q4KTraits>::get(xs, kbx, iqs);
+        Q5KTraits::X r;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) r.u[i] = v.u[i];
+        r.d8[0] = v.d8[0];
+        r.d8[1] = v.d8[1];
+        return r;
+    }
+};
 template<> struct Staged<Q6KTraits> {                                                           // 1680 bytes
     static constexpr int C = 8, MAX_COLS = 8, ROLL = 2, ROWC = 12;
     // int q = 0..7 of a Q8_1 block with the scale
@@ -2225,6 +2244,10 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     GUILD_WAVE_MMVQ(Q5KTraits)
+    if (staged_mmvq<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+        launch_check();
+        return;
+    }
     if (ncols > 1) {
         launch_multi<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
