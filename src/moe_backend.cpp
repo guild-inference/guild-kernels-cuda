@@ -684,6 +684,8 @@ guild_status_t qwen_v1(const guild_exec_context_v1_t* ctx, const guild_cuda_qwen
                 math::FusedGrArgs args[math::kFusedGrMaxT]{};
                 for (int t = 0; t < c.n_tok; ++t) {
                     args[t] = make_fused_gr_args(c.fused_gr_multi[t]);
+                    args[t].w_down_q8 = c.hc_down_q8;   // the Q8_0 weights, the same for every token
+                    args[t].w_up_q8 = c.hc_up_q8;
                 }
                 math::fused_gr_read_multi(args, c.n_tok, c.xn_scratch, stream, c.stamp_buf, c.stamp_i0);
                 break;
@@ -754,7 +756,11 @@ const guild_cuda_moe_ext_v1_t table = {
     sizeof(guild_cuda_moe_ext_v1_t),
     GUILD_CUDA_MOE_TAG_V1,
     GUILD_CUDA_MOE_VERSION_V1,
+#if defined(__HIPCC__)
     0u,
+#else
+    GUILD_CUDA_MOE_CAP_HC_Q8_0_V1,
+#endif
     configure_v1,
     quantize_dequant_v1,
     s_gemv_v1,

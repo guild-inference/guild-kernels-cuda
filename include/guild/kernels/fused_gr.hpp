@@ -39,9 +39,16 @@ struct FusedGrArgs {
     float* rs = nullptr;               ///< workspace, hc floats
     float* inject_out = nullptr;       ///< hc floats (when w_inject)
     float* mixed = nullptr;            ///< n_embd
+    /// The GGUF's own Q8_0 w_down / w_up (both or neither), in two planes each: the rows' int8 values, then their
+    /// f16 scales, one a 32 values (both row-major).  When set, fused_gr_read_multi reads these instead of w_down /
+    /// w_up (which may be null) and w_inject stays bf16; fused_gr_read refuses them (no scratch for xn).
+    const int8_t* w_down_q8 = nullptr; ///< [hc_lr][hc*n_embd]
+    const int8_t* w_up_q8 = nullptr;   ///< [hc*n_embd][hc_lr]
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
+/// Whether fused_gr_read_multi takes Q8_0 w_down_q8 / w_up_q8 (CUDA builds; a host checks its module's caps).
+bool fused_gr_q8_supported();
 void fused_gr_read(const FusedGrArgs& a, void* stream);
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
