@@ -1668,9 +1668,12 @@ template<typename F> struct RollChunked { static constexpr int v = Staged<F>::RO
 // fastest.  Q6_K 2560 -> 248320 on a GTX 1070, us at 1 to 8 columns: 2505 3224 3631 4780 4961 6141 7372 7627 before,
 // 2429 2439 2707 3049 3477 3923 5451 6069 after (without the 1-block bound: 2438 2493 2888 3457 4401 5530 5708 6565);
 // 2304 and 3072 wide (9 and 12 blocks) at 4 columns 1064 -> 737 and 1451 -> 921 us.
-// GUILD_MMVQ_ROW_CHUNK=0 turns them off.
+// GUILD_MMVQ_ROW_CHUNK=0 turns them off.  Which rows take them is staged_one's rule (Q4_K's and Q6_K's rows of
+// exactly C blocks too, for whom the C = ROWC kernel's add order is the chunked one's: see there).
 template<> struct Staged<Q4KTraits> {                                                           // 1152 bytes
-    static constexpr int C = 8, MAX_COLS = 3, ROLL = 9, ROWC = 0;
+    static constexpr int C = 8, MAX_COLS = 3, ROLL = 9, ROWC = 16;
+    // the one-chunk kernels' product: Q4KTraits::apply is dot(r, load_x(...)), so the chunked kernels' expression
+    __device__ static float dot(const Q4KTraits::W& r, const Q4KTraits::X& v) { return Q4KTraits::dot(r, v); }
     // slot s = kqs / 2 % 4 of a Q8_1 block: its ints s and s + 4 and the scale.  6 slots of 16 bytes a block, so
     // the two blocks a quarter-warp reads (two apart) fall in different banks.
     static constexpr int XREC = 96, XSLOTS = 4;
@@ -2006,6 +2009,33 @@ void staged_launch(int ncols, bool xr, const void* weights, const void* x_q8_1, 
 }
 // GUILD_MMVQ_ROW_CHUNK=0: rows of C < blocks <= ROWC in chunks of C, as before the one-chunk kernels (Staged::ROWC)
 bool g_row_chunk_off = std::getenv("GUILD_MMVQ_ROW_CHUNK") && std::string(std::getenv("GUILD_MMVQ_ROW_CHUNK")) == "0";
+// GUILD_MMVQ_ONE_WIDE=0: staged_one's rule as before Q4_K's one-chunk rows (Q4_K always in chunks, Q6_K's one-chunk
+// rows from C + 1 blocks), and no 4-column split (GUILD_MMVQ_SPLIT4=0 turns off only that)
+bool g_one_wide_off = std::getenv("GUILD_MMVQ_ONE_WIDE") && std::string(std::getenv("GUILD_MMVQ_ONE_WIDE")) == "0";
+bool g_split4_off = std::getenv("GUILD_MMVQ_SPLIT4") && std::string(std::getenv("GUILD_MMVQ_SPLIT4")) == "0";
+
+// Whether a row of nb blocks is one chunk (the C = ROWC kernels) at ncols columns.  A row of exactly C blocks is one
+// chunk of the chunked kernel too, so its bits are the same either way: each thread takes the same blocks in the same
+// order (the one-chunk kernel's extra i steps are past the row: kbx < nb), and the four sums are added ((0 + 1) + 2)
+// + 3 in both.  Q4_K's rows of 9 to 16 blocks: the i loop over C / BPI = 2 visits block tid / 16, then 8 + tid / 16,
+// what chunks 0 and 1 did, into the same sum.  Measured in a harness on a GTX 1070, us (chunked -> one chunk):
+//   Q4_K 2560 -> 10240 (10 blocks)  1 / 2 / 3 columns 75.9 -> 72.3, 100.3 -> 75.1, 133.2 -> 100.4
+//   Q4_K 2048 -> 8192 (8 blocks)                       51.7 -> 49.8,  72.0 -> 62.8,  93.3 -> 78.4
+//   Q4_K 4096 -> 2048 (16 blocks)                      28.2 -> 26.8,  37.6 -> 28.8,  44.3 -> 52.2 (slower)
+//   Q6_K 2048 -> 8192 (8 blocks)                       69.8 -> 68.0,  77.2 -> 76.7,  99.9 -> 88.8; 4 to 8 columns
+//                                                      -23 to -29%
+// so Q4_K's rows of more than 10 blocks stay chunked from three columns (11 to 15 blocks were not measured there).
+template<typename F>
+bool staged_one(int nb, int ncols) {
+    constexpr int C = Staged<F>::C, ROWC = Staged<F>::ROWC;
+    if (ROWC == 0 || g_row_chunk_off || nb > ROWC) return false;
+    if constexpr (std::is_same<F, Q4KTraits>::value)
+        return !g_one_wide_off && nb >= C && !(ncols >= 3 && nb > 10);
+    else if constexpr (std::is_same<F, Q6KTraits>::value)
+        return g_one_wide_off ? nb > C : nb >= C;
+    else
+        return nb > C;
+}
 
 // false: the caller takes its usual path
 template<typename F>
@@ -2013,12 +2043,24 @@ bool staged_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, in
     if constexpr (Staged<F>::C == 0) {
         return false;
     } else {
+        const int nb = n_in / F::DIV;
+        // Q4_K's four columns as two calls of two, columns 0-1 and 2-3, where two columns are one chunk a row: each
+        // column of a call is bitwise its one-column call (the native MMVQ contract), so the split is too.  Qwen3.8's
+        // 2560-wide rows on a GTX 1070 (harness, us): qkv 171.5 (launch_multi) -> 2 x 75.1, attn_q 202 -> 182, gate
+        // 101.9 -> 99.  If the second call were refused (it is the first one's shape, so it is not), the caller's
+        // kernels would write all four columns, the first two with the same bits.
+        if constexpr (std::is_same<F, Q4KTraits>::value)
+            if (ncols == 4 && !g_split4_off && !g_one_wide_off && g_multi_exact && staged_one<F>(nb, 2)) {
+                if (!staged_mmvq<F>(weights, x_q8_1, y, n_in, n_out, 2, stream)) return false;
+                const std::size_t xcol = std::size_t(n_in / Q8K) * sizeof(Q81Block);
+                return staged_mmvq<F>(weights, static_cast<const uint8_t*>(x_q8_1) + 2 * xcol,
+                                      y + 2 * std::size_t(n_out), n_in, n_out, 2, stream);
+            }
         // the upstream multi-column layout asked for, or a row base not 16-byte aligned
         if (g_staged_off || ncols > Staged<F>::MAX_COLS || (ncols > 1 && !g_multi_exact) ||
             reinterpret_cast<std::uintptr_t>(weights) % 16 != 0)
             return false;
-        const int nb = n_in / F::DIV;
-        const bool one = Staged<F>::ROWC > 0 && !g_row_chunk_off && nb > Staged<F>::C && nb <= Staged<F>::ROWC;
+        const bool one = staged_one<F>(nb, ncols);
         const int wbytes = one ? staged_wbytes<F, Staged<F>::ROWC>(n_in) : staged_wbytes<F, Staged<F>::C>(n_in);
         auto smem_of = [&](bool xr) {
             const std::size_t xbytes = std::size_t(ncols) * std::size_t(xr ? staged_xcol<F, true>(n_in)
