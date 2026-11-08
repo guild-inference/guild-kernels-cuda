@@ -2036,6 +2036,16 @@ bool staged_one(int nb, int ncols) {
     else
         return nb > C;
 }
+// Q4_K's four columns as two 2-column calls (staged_mmvq): for rows of kSplit4Min to kSplit4Max blocks only, where two
+// one-chunk 2-column passes over the row beat one upstream 4-column pass (launch_multi).  glm5_kernels_test shapes
+// (GLM5_SHAPES_ONLY=q4w) on a GTX 1070, Q4_K x 8192 rows at 4 columns, us, GUILD_MMVQ_SPLIT4=0 -> split, min of three
+// alternated runs: 8 blocks 101.1 -> 108.0, 9: 134.0 -> 123.9, 10: 137.0 -> 126.6, 11: 150.6 -> 141.8, 12: 152.3 ->
+// 145.9, 14: 165.8 -> 168.1, 16: 179.4 -> 190.5 (13 was not measured, so it is not split).
+constexpr int kSplit4Min = 9, kSplit4Max = 12;
+bool q4k_split4(int nb) {
+    return !g_split4_off && !g_one_wide_off && g_multi_exact && nb >= kSplit4Min && nb <= kSplit4Max &&
+           staged_one<Q4KTraits>(nb, 2);
+}
 
 // false: the caller takes its usual path
 template<typename F>
@@ -2044,13 +2054,13 @@ bool staged_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, in
         return false;
     } else {
         const int nb = n_in / F::DIV;
-        // Q4_K's four columns as two calls of two, columns 0-1 and 2-3, where two columns are one chunk a row: each
-        // column of a call is bitwise its one-column call (the native MMVQ contract), so the split is too.  Qwen3.8's
-        // 2560-wide rows on a GTX 1070 (harness, us): qkv 171.5 (launch_multi) -> 2 x 75.1, attn_q 202 -> 182, gate
-        // 101.9 -> 99.  If the second call were refused (it is the first one's shape, so it is not), the caller's
-        // kernels would write all four columns, the first two with the same bits.
+        // Q4_K's four columns as two calls of two, columns 0-1 and 2-3, for the rows q4k_split4 takes: each column of
+        // a call is bitwise its one-column call (the native MMVQ contract), so the split is too.  Qwen3.8's 2560-wide
+        // rows on a GTX 1070 (harness, us): qkv 171.5 (launch_multi) -> 2 x 75.1, attn_q 202 -> 182, gate 101.9 -> 99.
+        // If the second call were refused (it is the first one's shape, so it is not), the caller's kernels would
+        // write all four columns, the first two with the same bits.
         if constexpr (std::is_same<F, Q4KTraits>::value)
-            if (ncols == 4 && !g_split4_off && !g_one_wide_off && g_multi_exact && staged_one<F>(nb, 2)) {
+            if (ncols == 4 && q4k_split4(nb)) {
                 if (!staged_mmvq<F>(weights, x_q8_1, y, n_in, n_out, 2, stream)) return false;
                 const std::size_t xcol = std::size_t(n_in / Q8K) * sizeof(Q81Block);
                 return staged_mmvq<F>(weights, static_cast<const uint8_t*>(x_q8_1) + 2 * xcol,
